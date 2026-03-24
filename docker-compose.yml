@@ -1,6 +1,7 @@
 version: '3.8'
 
 services:
+  # === 1. 核心 AI 中枢控制服务 ===
   backend:
     build: ./backend
     container_name: jobcopilot_backend
@@ -9,9 +10,34 @@ services:
     volumes:
       - ./backend:/app
     environment:
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL}
+      - MCP_SERVER_URL=http://mcp_server:8001/sse # 向后端告知爬虫节点的内部地址
+      - DATABASE_URL=${DATABASE_URL}
+      - JWT_SECRET=${JWT_SECRET}
+      - JWT_EXPIRE_MINUTES=${JWT_EXPIRE_MINUTES}
+      - GEO_AMAP_KEY=${GEO_AMAP_KEY}
+      - GEO_TENCENT_KEY=${GEO_TENCENT_KEY}
+    depends_on:
+      - mcp_server
     restart: unless-stopped
 
+  # === 2. MCP Server (提供获取位置、爬取Boss直聘工具) ===
+  mcp_server:
+    build: ./mcp_server
+    container_name: jobcopilot_mcp_server
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./mcp_server:/app
+    environment:
+      - GEO_PROVIDER=${GEO_PROVIDER}
+      - GEO_AMAP_KEY=${GEO_AMAP_KEY}
+      - GEO_IPINFO_TOKEN=${GEO_IPINFO_TOKEN}
+      - GEO_DEFAULT_CITY=${GEO_DEFAULT_CITY}
+    restart: unless-stopped
+
+  # === 3. 大屏前端服务 ===
   frontend:
     build: ./frontend
     container_name: jobcopilot_frontend

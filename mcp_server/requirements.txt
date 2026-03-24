@@ -1,0 +1,7 @@
+mcp[cli]
+DrissionPage
+requests
+uvicorn
+fastapi
+starlette
+sse-starlette

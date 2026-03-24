@@ -24,19 +24,19 @@
 
 ## 🛠️ 核心工作流 (Multi-Agent Flow)
 
-### 💼 阶段一：简历定制流水线 (Resume Customization Graph) - [✅ 已完成核心架构]
+### 💼 阶段一：简历定制流水线 (Resume Customization Graph) 
 - **简历解析官**：读取原始简历，提取结构化技能、教育与项目经历 (UserInfo Schema)。
 - **岗位分析官**：读取 JD 文本，提取核心技能、加分项与业务场景预测 (JDInfo Schema)。
 - **简历优化师**：基于上述信息，使用 STAR 法则，将 JD 关键词自然融入候选人原有项目。
 - **求职信撰写师**：生成一封针对该公司的硬核技术 Cover Letter。
 
-### 🎙️ 阶段二：模拟面试流水线 (Mock Interview Graph) - [🗓️ 开发计划中]
+### 🎙️ 阶段二：模拟面试流水线 (Mock Interview Graph)
 - **知识库 (RAG)**：基于开源的高质量八股文笔记（如 JavaGuide / CS-Notes），为 AI 提供严谨的技术基座。
 - **出题官 / 追问官**：基于 JD 偏好出硬核题目；利用 LangGraph 循环状态机与用户进行 Human-in-the-loop 多轮切磋打分。
 
 ---
 
-## 🚀 快速开始运行 (Docker 部署)
+##  快速开始运行 (Docker 部署)
 
 本项目采用了前后端分离的双容器架构。环境依赖全权由 Docker 处理，无需在本地配置繁杂的 Python 环境。
 
@@ -46,7 +46,29 @@
 ### 1. 配置环境变量
 在项目根目录（`docker-compose.yml` 同级目录）新建/确认存在 `.env` 文件：
 ```env
-OPENAI_API_KEY=sk-xxxxxx...  # 请替换为你的真实 API Key (支持通用 OpenAI 兼容接口)
+DEEPSEEK_API_KEY=sk-xxxxxx...
+OPENAI_BASE_URL=https://api.deepseek.com
+
+# Docker 内 backend 访问你本机 MySQL（Windows/Mac 推荐 host.docker.internal）
+DATABASE_URL=mysql+pymysql://root:你的密码@host.docker.internal:3306/jobcopilot?charset=utf8mb4
+
+JWT_SECRET=请替换成随机强密钥
+JWT_EXPIRE_MINUTES=10080
+
+# 定位服务配置（可选）
+# auto: 依次尝试 amap -> ip-api -> ipinfo
+GEO_PROVIDER=auto
+GEO_AMAP_KEY=
+GEO_IPINFO_TOKEN=
+GEO_DEFAULT_CITY=北京
+
+# 后端反向地理编码（浏览器坐标 -> 城市）
+GEO_TENCENT_KEY=
+```
+
+首次运行前请先在 MySQL 中创建数据库：
+```sql
+CREATE DATABASE jobcopilot CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 ```
 
 ### 2. 构建与启动
@@ -59,6 +81,14 @@ docker compose up -d --build
 ### 3. 访问应用
 - **用户前端入口** (Streamlit): [http://localhost:8501](http://localhost:8501)
 - **后端 API 文档** (Swagger): [http://localhost:8000/docs](http://localhost:8000/docs)
+
+### 4. 登录与定位授权（新增）
+- 前端侧边栏支持注册/登录，登录后会持有 JWT。
+- 当聊天命中“附近职位检索”且未授权定位时，系统会提示授权。
+- 用户可选“仅本次允许”或“始终允许”：
+	- 仅本次允许：只对当前请求生效，不持久化。
+	- 始终允许：持久化授权策略到 MySQL。
+- 系统优先使用浏览器定位坐标，并在后端通过地图 API 反向解析城市；不持久化城市，避免用户跨城后的陈旧数据。
 
 ---
 
