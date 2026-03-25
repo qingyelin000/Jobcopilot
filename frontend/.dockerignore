@@ -1,0 +1,8 @@
+node_modules
+dist
+.npm-cache
+npm-debug.log
+README.md
+__pycache__
+app.py
+requirements.txt

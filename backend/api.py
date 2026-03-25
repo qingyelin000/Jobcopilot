@@ -1,12 +1,17 @@
 import asyncio
+from collections import OrderedDict
 from contextlib import AsyncExitStack
-from fastapi import Depends, FastAPI, Header, HTTPException
+import hashlib
+from io import BytesIO
+from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import agents
 import os
 import json
 import requests
 from sqlalchemy.orm import Session
+from PyPDF2 import PdfReader
 
 from langchain_openai import ChatOpenAI
 # MCP 核心连接组件
@@ -25,6 +30,25 @@ from db import Base, engine, get_db
 from models import User
 
 app = FastAPI(title="JobCopilot API Backend")
+PROCESS_CACHE_MAX_SIZE = 32
+process_cache: OrderedDict[str, dict] = OrderedDict()
+
+frontend_origins = [
+    origin.strip()
+    for origin in os.getenv(
+        "FRONTEND_ORIGINS",
+        "http://localhost:5173,http://127.0.0.1:5173,http://localhost:8501,http://127.0.0.1:8501",
+    ).split(",")
+    if origin.strip()
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=frontend_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.on_event("startup")
@@ -34,6 +58,12 @@ def startup_event():
 class ProcessRequest(BaseModel):
     resume_text: str
     jd_text: str
+
+class ParsePdfResponse(BaseModel):
+    filename: str
+    page_count: int
+    char_count: int
+    text: str
 
 class ChatRequest(BaseModel):
     message: str
@@ -159,6 +189,40 @@ async def call_mcp_tool(session: ClientSession, tool_name: str, arguments: dict)
     return _mcp_result_to_text(result)
 
 
+def _extract_text_from_pdf_bytes(file_bytes: bytes) -> tuple[str, int]:
+    reader = PdfReader(BytesIO(file_bytes))
+    pages: list[str] = []
+
+    for page in reader.pages:
+        page_text = (page.extract_text() or "").strip()
+        if page_text:
+            pages.append(page_text)
+
+    return "\n\n".join(pages).strip(), len(reader.pages)
+
+
+def _build_process_cache_key(resume_text: str, jd_text: str) -> str:
+    payload = f"{resume_text}\n---JD---\n{jd_text}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _get_cached_process_result(cache_key: str) -> dict | None:
+    cached = process_cache.get(cache_key)
+    if cached is None:
+        return None
+
+    process_cache.move_to_end(cache_key)
+    return cached
+
+
+def _store_cached_process_result(cache_key: str, payload: dict) -> None:
+    process_cache[cache_key] = payload
+    process_cache.move_to_end(cache_key)
+
+    while len(process_cache) > PROCESS_CACHE_MAX_SIZE:
+        process_cache.popitem(last=False)
+
+
 @app.post("/api/v1/auth/register", response_model=TokenResponse)
 def register(req: RegisterRequest, db: Session = Depends(get_db)):
     existing_user = db.query(User).filter(User.username == req.username).first()
@@ -214,39 +278,65 @@ def update_preferences(
         location_consent=current_user.location_consent,
     )
 
+
+@app.post("/api/v1/resume/parse-pdf", response_model=ParsePdfResponse)
+async def parse_resume_pdf(file: UploadFile = File(...)):
+    filename = (file.filename or "").strip()
+    if not filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="请上传 PDF 文件")
+
+    try:
+        file_bytes = await file.read()
+        if not file_bytes:
+            raise HTTPException(status_code=400, detail="上传的 PDF 为空")
+
+        text, page_count = await asyncio.to_thread(_extract_text_from_pdf_bytes, file_bytes)
+        if not text:
+            raise HTTPException(status_code=400, detail="PDF 中没有可提取的文本")
+
+        return ParsePdfResponse(
+            filename=filename,
+            page_count=page_count,
+            char_count=len(text),
+            text=text,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"PDF 解析失败: {exc}") from exc
+
 @app.post("/api/v1/process")
 async def process_job_application(req: ProcessRequest):
-    """一键处理流水线：并发解析 -> 并发生成"""
+    """Parse resume and JD, build the match mapping, then rewrite resume bullets."""
     try:
-        # ==========================================
-        # ⚡ 速度优化：第一阶段 (并发解析输入数据)
-        # ==========================================
-        # 使用 asyncio.to_thread 将同步的 requests 网络请求放入后台线程池中，实现兵分两路同时调用 API
+        cache_key = _build_process_cache_key(req.resume_text, req.jd_text)
+        cached_response = _get_cached_process_result(cache_key)
+        if cached_response is not None:
+            return cached_response
+
         user_info_task = asyncio.to_thread(agents.parse_resume_to_json, req.resume_text)
         jd_info_task = asyncio.to_thread(agents.parse_jd_to_json, req.jd_text)
-        
-        # 等待两个解析兵同时完成并带回结果
         user_info, jd_info = await asyncio.gather(user_info_task, jd_info_task)
 
-        # ==========================================
-        # ⚡ 速度优化：第二阶段 (并发生成输出数据)
-        # ==========================================
-        # 拿到组装好基础数据的 JSON 后，再兵分两路，分别交给两个不同的 Agent 撰写对应内容
-        opt_resume_task = asyncio.to_thread(agents.optimize_resume, user_info, jd_info)
-        cover_letter_task = asyncio.to_thread(agents.write_cover_letter, user_info, jd_info)
-        
-        # 等待两个撰写兵同时完工
-        optimized_resume, cover_letter = await asyncio.gather(opt_resume_task, cover_letter_task)
+        match_mapping = await asyncio.to_thread(agents.map_resume_to_jd, user_info, jd_info)
+        optimized_resume = await asyncio.to_thread(
+            agents.rewrite_resume_bullets,
+            user_info,
+            jd_info,
+            match_mapping,
+        )
 
-        return {
+        response_payload = {
             "status": "success",
             "data": {
                 "user_info": user_info.model_dump(),
                 "jd_info": jd_info.model_dump(),
+                "match_mapping": match_mapping.model_dump(),
                 "optimized_resume": optimized_resume.model_dump(),
-                "cover_letter": cover_letter.model_dump()
-            }
+            },
         }
+        _store_cached_process_result(cache_key, response_payload)
+        return response_payload
     except Exception as e:
         import traceback
         traceback.print_exc()

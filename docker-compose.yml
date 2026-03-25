@@ -18,6 +18,7 @@ services:
       - JWT_EXPIRE_MINUTES=${JWT_EXPIRE_MINUTES}
       - GEO_AMAP_KEY=${GEO_AMAP_KEY}
       - GEO_TENCENT_KEY=${GEO_TENCENT_KEY}
+      - FRONTEND_ORIGINS=http://localhost:5173,http://127.0.0.1:5173,http://localhost:8501,http://127.0.0.1:8501
     depends_on:
       - mcp_server
     restart: unless-stopped
@@ -42,11 +43,7 @@ services:
     build: ./frontend
     container_name: jobcopilot_frontend
     ports:
-      - "8501:8501"
-    volumes:
-      - ./frontend:/app
-    environment:
-      - API_URL=http://backend:8000
+      - "8501:80"
     depends_on:
       - backend
     restart: unless-stopped

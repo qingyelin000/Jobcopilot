@@ -1,4 +1,0 @@
-streamlit
-requests
-PyPDF2
-streamlit-js-eval

@@ -12,6 +12,8 @@ mcp
 requests
 sqlalchemy
 pymysql
+PyPDF2
+python-multipart
 passlib[bcrypt]
 bcrypt==3.2.2
 python-jose[cryptography]
