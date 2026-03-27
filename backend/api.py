@@ -1,8 +1,9 @@
 import asyncio
-from collections import OrderedDict
 from contextlib import AsyncExitStack
+from datetime import datetime
 import hashlib
 from io import BytesIO
+import uuid
 from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -10,6 +11,8 @@ import agents
 import os
 import json
 import requests
+from document_assets import mark_interrupted_document_jobs, router as document_router
+from sqlalchemy import inspect, text
 from sqlalchemy.orm import Session
 from PyPDF2 import PdfReader
 
@@ -21,17 +24,19 @@ from intent_agent import llm_build_intent_plan, llm_evaluate_completion
 from auth import create_access_token, decode_access_token, get_password_hash, verify_password
 from auth_schemas import (
     LoginRequest,
+    PasswordChangeRequest,
+    PasswordChangeResponse,
     RegisterRequest,
     TokenResponse,
     UserPreferenceUpdate,
     UserProfileResponse,
+    UserProfileUpdate,
 )
-from db import Base, engine, get_db
-from models import User
+from db import Base, SessionLocal, engine, get_db
+from models import JDDocument, ResumeDocument, ResumeProcessJob, User
+from schemas import JDInfo, UserInfo
 
 app = FastAPI(title="JobCopilot API Backend")
-PROCESS_CACHE_MAX_SIZE = 32
-process_cache: OrderedDict[str, dict] = OrderedDict()
 
 frontend_origins = [
     origin.strip()
@@ -42,6 +47,13 @@ frontend_origins = [
     if origin.strip()
 ]
 
+
+def _feature_enabled(name: str, default: bool = True) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=frontend_origins,
@@ -49,15 +61,77 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(document_router)
+
+
+def _ensure_user_profile_columns() -> None:
+    inspector = inspect(engine)
+    if "users" not in inspector.get_table_names():
+        return
+
+    existing_columns = {column["name"] for column in inspector.get_columns("users")}
+    alter_statements = {
+        "full_name": "ALTER TABLE users ADD COLUMN full_name VARCHAR(120) NULL",
+        "email": "ALTER TABLE users ADD COLUMN email VARCHAR(120) NULL",
+        "phone": "ALTER TABLE users ADD COLUMN phone VARCHAR(40) NULL",
+        "city": "ALTER TABLE users ADD COLUMN city VARCHAR(80) NULL",
+        "target_role": "ALTER TABLE users ADD COLUMN target_role VARCHAR(120) NULL",
+        "profile_summary": "ALTER TABLE users ADD COLUMN profile_summary TEXT NULL",
+    }
+
+    with engine.begin() as connection:
+        for column_name, statement in alter_statements.items():
+            if column_name in existing_columns:
+                continue
+            connection.execute(text(statement))
+
+
+def _serialize_user_profile(user: User) -> UserProfileResponse:
+    return UserProfileResponse(
+        id=user.id,
+        username=user.username,
+        location_consent=user.location_consent,
+        full_name=user.full_name,
+        email=user.email,
+        phone=user.phone,
+        city=user.city,
+        target_role=user.target_role,
+        profile_summary=user.profile_summary,
+    )
 
 
 @app.on_event("startup")
 def startup_event():
     Base.metadata.create_all(bind=engine)
+    _ensure_user_profile_columns()
+    _mark_interrupted_process_jobs()
+    mark_interrupted_document_jobs()
 
 class ProcessRequest(BaseModel):
     resume_text: str
     jd_text: str
+
+
+class ProcessJobResponse(BaseModel):
+    job_id: str
+    status: str
+    stage: str
+    progress: int
+    message: str
+    data: dict | None = None
+    error: str | None = None
+
+
+class ProcessHistoryItemResponse(BaseModel):
+    job_id: str
+    status: str
+    stage: str
+    progress: int
+    message: str
+    headline: str
+    subtitle: str | None = None
+    created_at: datetime
+    updated_at: datetime
 
 class ParsePdfResponse(BaseModel):
     filename: str
@@ -206,21 +280,495 @@ def _build_process_cache_key(resume_text: str, jd_text: str) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def _get_cached_process_result(cache_key: str) -> dict | None:
-    cached = process_cache.get(cache_key)
-    if cached is None:
+def _build_content_hash(source_text: str) -> str:
+    return hashlib.sha256(source_text.encode("utf-8")).hexdigest()
+
+
+_UNSET = object()
+
+
+def _clone_process_data(data: dict | None) -> dict | None:
+    if data is None:
+        return None
+    return json.loads(json.dumps(data, ensure_ascii=False))
+
+
+def _hydrate_jd_info_payload(payload: dict | None, jd_text: str) -> dict | None:
+    if not isinstance(payload, dict):
+        return payload
+    if not jd_text.strip():
+        return payload
+
+    raw_jd = payload.get("jd_info")
+    if not isinstance(raw_jd, dict):
+        return payload
+
+    try:
+        jd_info = JDInfo.model_validate(raw_jd)
+    except Exception:
+        return payload
+
+    enriched = agents.enrich_jd_info(jd_info, jd_text)
+    if enriched.job_title == jd_info.job_title and enriched.business_domain == jd_info.business_domain:
+        return payload
+
+    next_payload = _clone_process_data(payload) or {}
+    next_payload["jd_info"] = enriched.model_dump()
+    return next_payload
+
+
+def _payload_has_jd_title(payload: dict | None) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    raw_jd = payload.get("jd_info")
+    if not isinstance(raw_jd, dict):
+        return False
+    return bool(str(raw_jd.get("job_title") or "").strip())
+
+
+def _serialize_process_job(job: ResumeProcessJob) -> dict:
+    return {
+        "job_id": job.job_id,
+        "status": job.status,
+        "stage": job.stage,
+        "progress": job.progress,
+        "message": job.message,
+        "data": _clone_process_data(job.data),
+        "error": job.error,
+    }
+
+
+def _compact_text(value: str | None, fallback: str | None = None, limit: int = 68) -> str | None:
+    text = (value or fallback or "").strip()
+    if not text:
+        return None
+    if len(text) <= limit:
+        return text
+    return f"{text[: limit - 1].rstrip()}..."
+
+
+def _serialize_process_history_item(job: ResumeProcessJob) -> dict:
+    data = job.data or {}
+    jd_info = data.get("jd_info") or {}
+    match_mapping = data.get("match_mapping") or {}
+    optimized_resume = data.get("optimized_resume") or {}
+
+    headline = _compact_text(
+        jd_info.get("job_title"),
+        match_mapping.get("candidate_positioning") or "简历优化任务",
+        limit=40,
+    ) or "简历优化任务"
+    subtitle = _compact_text(
+        jd_info.get("business_domain"),
+        optimized_resume.get("summary_hook") or job.message,
+        limit=72,
+    )
+
+    return {
+        "job_id": job.job_id,
+        "status": job.status,
+        "stage": job.stage,
+        "progress": job.progress,
+        "message": job.message,
+        "headline": headline,
+        "subtitle": subtitle,
+        "created_at": job.created_at,
+        "updated_at": job.updated_at,
+    }
+
+
+def _scoped_process_job_query(db: Session, user_id: int | None):
+    query = db.query(ResumeProcessJob)
+    if user_id is None:
+        return query.filter(ResumeProcessJob.user_id.is_(None))
+    return query.filter(ResumeProcessJob.user_id == user_id)
+
+
+def _mark_interrupted_process_jobs() -> None:
+    db = SessionLocal()
+    try:
+        running_jobs = db.query(ResumeProcessJob).filter(ResumeProcessJob.status == "running").all()
+        if not running_jobs:
+            return
+
+        for job in running_jobs:
+            job.status = "error"
+            job.stage = "error"
+            job.progress = 100
+            job.message = "服务已重启，请重新发起简历优化"
+            job.error = "server_restarted"
+
+        db.commit()
+    finally:
+        db.close()
+
+
+def _get_cached_process_result(cache_key: str, user_id: int | None) -> dict | None:
+    db = SessionLocal()
+    try:
+        job = (
+            _scoped_process_job_query(db, user_id)
+            .filter(
+                ResumeProcessJob.cache_key == cache_key,
+                ResumeProcessJob.status == "success",
+            )
+            .order_by(ResumeProcessJob.updated_at.desc())
+            .first()
+        )
+        if job is None or job.data is None:
+            return None
+
+        return {
+            "status": "success",
+            "data": _clone_process_data(job.data),
+        }
+    finally:
+        db.close()
+
+
+def _get_cached_process_job(cache_key: str, user_id: int | None) -> dict | None:
+    db = SessionLocal()
+    try:
+        job = (
+            _scoped_process_job_query(db, user_id)
+            .filter(
+                ResumeProcessJob.cache_key == cache_key,
+                ResumeProcessJob.status == "success",
+            )
+            .order_by(ResumeProcessJob.updated_at.desc())
+            .first()
+        )
+        if job is None:
+            return None
+
+        return _serialize_process_job(job)
+    finally:
+        db.close()
+
+
+def _get_running_process_job(cache_key: str, user_id: int | None) -> dict | None:
+    db = SessionLocal()
+    try:
+        job = (
+            _scoped_process_job_query(db, user_id)
+            .filter(
+                ResumeProcessJob.cache_key == cache_key,
+                ResumeProcessJob.status == "running",
+            )
+            .order_by(ResumeProcessJob.updated_at.desc())
+            .first()
+        )
+        if job is None:
+            return None
+
+        return _serialize_process_job(job)
+    finally:
+        db.close()
+
+
+def _get_process_job(job_id: str, user_id: int | None) -> dict | None:
+    db = SessionLocal()
+    try:
+        job = (
+            _scoped_process_job_query(db, user_id)
+            .filter(ResumeProcessJob.job_id == job_id)
+            .first()
+        )
+        if job is None:
+            return None
+
+        return _serialize_process_job(job)
+    finally:
+        db.close()
+
+
+def _find_ready_document_for_text(
+    db: Session,
+    model,
+    user_id: int,
+    source_text: str,
+):
+    content_hash = _build_content_hash(source_text)
+    document = (
+        db.query(model)
+        .filter(
+            model.user_id == user_id,
+            model.content_hash == content_hash,
+            model.status == "ready",
+        )
+        .order_by(model.updated_at.desc(), model.id.desc())
+        .first()
+    )
+    if document is not None:
+        return document
+
+    normalized_text = source_text.strip()
+    if not normalized_text:
         return None
 
-    process_cache.move_to_end(cache_key)
-    return cached
+    candidates = (
+        db.query(model)
+        .filter(
+            model.user_id == user_id,
+            model.status == "ready",
+        )
+        .order_by(model.updated_at.desc(), model.id.desc())
+        .all()
+    )
+    for candidate in candidates:
+        if (candidate.source_text or "").strip() == normalized_text:
+            return candidate
+
+    return None
 
 
-def _store_cached_process_result(cache_key: str, payload: dict) -> None:
-    process_cache[cache_key] = payload
-    process_cache.move_to_end(cache_key)
+def _load_cached_resume_user_info(resume_text: str, user_id: int | None) -> UserInfo | None:
+    if user_id is None:
+        return None
 
-    while len(process_cache) > PROCESS_CACHE_MAX_SIZE:
-        process_cache.popitem(last=False)
+    db = SessionLocal()
+    try:
+        document = _find_ready_document_for_text(db, ResumeDocument, user_id, resume_text)
+        if document is None or not isinstance(document.parsed_json, dict):
+            return None
+
+        try:
+            return UserInfo.model_validate(document.parsed_json)
+        except Exception:
+            return None
+    finally:
+        db.close()
+
+
+def _load_cached_jd_info(jd_text: str, user_id: int | None) -> JDInfo | None:
+    if user_id is None:
+        return None
+
+    db = SessionLocal()
+    try:
+        document = _find_ready_document_for_text(db, JDDocument, user_id, jd_text)
+        if document is None or not isinstance(document.parsed_json, dict):
+            return None
+
+        try:
+            jd_info = JDInfo.model_validate(document.parsed_json)
+            return agents.enrich_jd_info(
+                jd_info,
+                jd_text,
+                title_hint=document.title,
+            )
+        except Exception:
+            return None
+    finally:
+        db.close()
+
+
+def _create_process_job(cache_key: str, user_id: int | None) -> dict:
+    db = SessionLocal()
+    try:
+        job = ResumeProcessJob(
+            job_id=uuid.uuid4().hex,
+            user_id=user_id,
+            cache_key=cache_key,
+            status="running",
+            stage="parsing",
+            progress=12,
+            message="正在解析简历与 JD",
+            data={},
+            error=None,
+        )
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        return _serialize_process_job(job)
+    finally:
+        db.close()
+
+
+def _create_completed_process_job(cache_key: str, user_id: int | None, data: dict) -> dict:
+    db = SessionLocal()
+    try:
+        job = ResumeProcessJob(
+            job_id=uuid.uuid4().hex,
+            user_id=user_id,
+            cache_key=cache_key,
+            status="success",
+            stage="done",
+            progress=100,
+            message="简历分析与优化已完成",
+            data=_clone_process_data(data),
+            error=None,
+        )
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        return _serialize_process_job(job)
+    finally:
+        db.close()
+
+
+def _update_process_job(
+    job_id: str,
+    *,
+    status: str | None = None,
+    stage: str | None = None,
+    progress: int | None = None,
+    message: str | None = None,
+    data: dict | None = None,
+    error: str | None | object = _UNSET,
+) -> dict:
+    db = SessionLocal()
+    try:
+        job = db.query(ResumeProcessJob).filter(ResumeProcessJob.job_id == job_id).first()
+        if job is None:
+            raise ValueError(f"Process job {job_id} not found")
+
+        if status is not None:
+            job.status = status
+        if stage is not None:
+            job.stage = stage
+        if progress is not None:
+            job.progress = progress
+        if message is not None:
+            job.message = message
+        if data:
+            merged_data = _clone_process_data(job.data) or {}
+            merged_data.update(_clone_process_data(data) or {})
+            job.data = merged_data
+        if error is not _UNSET:
+            job.error = error
+
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        return _serialize_process_job(job)
+    finally:
+        db.close()
+
+
+async def _build_process_payload(
+    req: ProcessRequest,
+    job_id: str | None = None,
+    user_id: int | None = None,
+) -> dict:
+    user_info = _load_cached_resume_user_info(req.resume_text, user_id)
+    jd_info = _load_cached_jd_info(req.jd_text, user_id)
+    reused_resume = user_info is not None
+    reused_jd = jd_info is not None
+
+    user_info_task = None if user_info is not None else asyncio.to_thread(agents.parse_resume_to_json, req.resume_text)
+    jd_info_task = None if jd_info is not None else asyncio.to_thread(agents.parse_jd_to_json, req.jd_text)
+
+    if user_info_task is not None and jd_info_task is not None:
+        user_info, jd_info = await asyncio.gather(user_info_task, jd_info_task)
+    elif user_info_task is not None:
+        user_info = await user_info_task
+    elif jd_info_task is not None:
+        jd_info = await jd_info_task
+
+    assert user_info is not None
+    assert jd_info is not None
+
+    if job_id is not None:
+        parse_done_message = "解析完成，正在生成匹配摘要"
+        if reused_resume and reused_jd:
+            parse_done_message = "已复用简历与 JD 解析结果，正在生成匹配摘要"
+        elif reused_resume:
+            parse_done_message = "已复用简历解析结果，正在生成匹配摘要"
+        elif reused_jd:
+            parse_done_message = "已复用 JD 解析结果，正在生成匹配摘要"
+
+        _update_process_job(
+            job_id,
+            stage="mapping",
+            progress=42,
+            message=parse_done_message,
+            data={
+                "user_info": user_info.model_dump(),
+                "jd_info": jd_info.model_dump(),
+            },
+        )
+
+    match_mapping = await asyncio.to_thread(agents.map_resume_to_jd, user_info, jd_info)
+    mapping_quality = await asyncio.to_thread(
+        agents.score_mapping_quality,
+        user_info,
+        jd_info,
+        match_mapping,
+    )
+
+    if job_id is not None:
+        _update_process_job(
+            job_id,
+            stage="rewriting",
+            progress=74,
+            message="匹配摘要已生成，正在重写项目表述",
+            data={
+                "match_mapping": match_mapping.model_dump(),
+                "mapping_quality": mapping_quality,
+            },
+        )
+
+    optimized_resume = await asyncio.to_thread(
+        agents.rewrite_resume_bullets,
+        user_info,
+        jd_info,
+        match_mapping,
+    )
+    rewrite_quality = await asyncio.to_thread(
+        agents.score_rewrite_quality,
+        user_info,
+        jd_info,
+        match_mapping,
+        optimized_resume,
+    )
+
+    if job_id is not None:
+        _update_process_job(
+            job_id,
+            stage="rewriting",
+            progress=92,
+            message="改写完成，正在计算质量评分。",
+            data={
+                "optimized_resume": optimized_resume.model_dump(),
+                "rewrite_quality": rewrite_quality,
+            },
+        )
+
+    return {
+        "status": "success",
+        "data": {
+            "user_info": user_info.model_dump(),
+            "jd_info": jd_info.model_dump(),
+            "match_mapping": match_mapping.model_dump(),
+            "optimized_resume": optimized_resume.model_dump(),
+            "mapping_quality": mapping_quality,
+            "rewrite_quality": rewrite_quality,
+        },
+    }
+
+
+async def _run_process_job(job_id: str, req: ProcessRequest, user_id: int | None) -> None:
+    try:
+        response_payload = await _build_process_payload(req, job_id=job_id, user_id=user_id)
+        _update_process_job(
+            job_id,
+            status="success",
+            stage="done",
+            progress=100,
+            message="简历分析与优化已完成",
+            data=response_payload["data"],
+            error=None,
+        )
+    except Exception as exc:
+        _update_process_job(
+            job_id,
+            status="error",
+            stage="error",
+            progress=100,
+            message="生成失败，请重试",
+            error=str(exc),
+        )
 
 
 @app.post("/api/v1/auth/register", response_model=TokenResponse)
@@ -254,11 +802,7 @@ def login(req: LoginRequest, db: Session = Depends(get_db)):
 
 @app.get("/api/v1/users/me", response_model=UserProfileResponse)
 def get_me(current_user: User = Depends(get_current_user)):
-    return UserProfileResponse(
-        id=current_user.id,
-        username=current_user.username,
-        location_consent=current_user.location_consent,
-    )
+    return _serialize_user_profile(current_user)
 
 
 @app.patch("/api/v1/users/me/preferences", response_model=UserProfileResponse)
@@ -272,11 +816,43 @@ def update_preferences(
     db.commit()
     db.refresh(current_user)
 
-    return UserProfileResponse(
-        id=current_user.id,
-        username=current_user.username,
-        location_consent=current_user.location_consent,
-    )
+    return _serialize_user_profile(current_user)
+
+
+@app.patch("/api/v1/users/me/profile", response_model=UserProfileResponse)
+def update_user_profile(
+    req: UserProfileUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    current_user.full_name = req.full_name.strip() if req.full_name is not None else None
+    current_user.email = req.email.strip() if req.email is not None else None
+    current_user.phone = req.phone.strip() if req.phone is not None else None
+    current_user.city = req.city.strip() if req.city is not None else None
+    current_user.target_role = req.target_role.strip() if req.target_role is not None else None
+    current_user.profile_summary = req.profile_summary.strip() if req.profile_summary is not None else None
+    db.add(current_user)
+    db.commit()
+    db.refresh(current_user)
+    return _serialize_user_profile(current_user)
+
+
+@app.patch("/api/v1/users/me/password", response_model=PasswordChangeResponse)
+def update_user_password(
+    req: PasswordChangeRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if not verify_password(req.current_password, current_user.password_hash):
+        raise HTTPException(status_code=400, detail="当前密码错误")
+
+    if req.current_password == req.new_password:
+        raise HTTPException(status_code=400, detail="新密码不能与当前密码相同")
+
+    current_user.password_hash = get_password_hash(req.new_password)
+    db.add(current_user)
+    db.commit()
+    return PasswordChangeResponse(success=True, message="密码修改成功")
 
 
 @app.post("/api/v1/resume/parse-pdf", response_model=ParsePdfResponse)
@@ -306,41 +882,129 @@ async def parse_resume_pdf(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail=f"PDF 解析失败: {exc}") from exc
 
 @app.post("/api/v1/process")
-async def process_job_application(req: ProcessRequest):
-    """Parse resume and JD, build the match mapping, then rewrite resume bullets."""
+async def process_job_application(
+    req: ProcessRequest,
+    current_user: User | None = Depends(get_current_user_optional),
+):
+    """Synchronous compatibility endpoint for the full resume optimization flow."""
     try:
         cache_key = _build_process_cache_key(req.resume_text, req.jd_text)
-        cached_response = _get_cached_process_result(cache_key)
+        user_id = current_user.id if current_user else None
+        cached_response = _get_cached_process_result(cache_key, user_id)
         if cached_response is not None:
-            return cached_response
+            hydrated_data = _hydrate_jd_info_payload(cached_response.get("data"), req.jd_text)
+            response_with_hydration = (
+                cached_response
+                if hydrated_data is cached_response.get("data")
+                else {
+                    "status": cached_response.get("status", "success"),
+                    "data": hydrated_data,
+                }
+            )
 
-        user_info_task = asyncio.to_thread(agents.parse_resume_to_json, req.resume_text)
-        jd_info_task = asyncio.to_thread(agents.parse_jd_to_json, req.jd_text)
-        user_info, jd_info = await asyncio.gather(user_info_task, jd_info_task)
+            if _payload_has_jd_title(response_with_hydration.get("data")):
+                return response_with_hydration
 
-        match_mapping = await asyncio.to_thread(agents.map_resume_to_jd, user_info, jd_info)
-        optimized_resume = await asyncio.to_thread(
-            agents.rewrite_resume_bullets,
-            user_info,
-            jd_info,
-            match_mapping,
-        )
+            cached_doc_jd = _load_cached_jd_info(req.jd_text, user_id)
+            if cached_doc_jd is None or not str(cached_doc_jd.job_title or "").strip():
+                return response_with_hydration
 
-        response_payload = {
-            "status": "success",
-            "data": {
-                "user_info": user_info.model_dump(),
-                "jd_info": jd_info.model_dump(),
-                "match_mapping": match_mapping.model_dump(),
-                "optimized_resume": optimized_resume.model_dump(),
-            },
-        }
-        _store_cached_process_result(cache_key, response_payload)
+            # Legacy cached result misses JD title; rebuild once to refresh output.
+            cached_response = None
+
+        response_payload = await _build_process_payload(req, user_id=user_id)
+        _create_completed_process_job(cache_key, user_id, response_payload["data"])
         return response_payload
     except Exception as e:
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/v1/process/start", response_model=ProcessJobResponse)
+async def start_process_job(
+    req: ProcessRequest,
+    current_user: User | None = Depends(get_current_user_optional),
+):
+    cache_key = _build_process_cache_key(req.resume_text, req.jd_text)
+    user_id = current_user.id if current_user else None
+
+    cached_job = _get_cached_process_job(cache_key, user_id)
+    if cached_job is not None:
+        hydrated_data = _hydrate_jd_info_payload(cached_job.get("data"), req.jd_text)
+        next_job = cached_job if hydrated_data is cached_job.get("data") else {**cached_job, "data": hydrated_data}
+
+        if _payload_has_jd_title(next_job.get("data")):
+            return next_job
+
+        cached_doc_jd = _load_cached_jd_info(req.jd_text, user_id)
+        if cached_doc_jd is None or not str(cached_doc_jd.job_title or "").strip():
+            return next_job
+        # Legacy cached job misses JD title; trigger a fresh run.
+
+    running_job = _get_running_process_job(cache_key, user_id)
+    if running_job is not None:
+        return running_job
+
+    job = _create_process_job(cache_key, user_id)
+    asyncio.create_task(_run_process_job(job["job_id"], req, user_id))
+    return job
+
+
+@app.get("/api/v1/process/history", response_model=list[ProcessHistoryItemResponse])
+async def get_process_history(
+    limit: int = 8,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    safe_limit = max(1, min(limit, 20))
+    jobs = (
+        db.query(ResumeProcessJob)
+        .filter(ResumeProcessJob.user_id == current_user.id)
+        .order_by(ResumeProcessJob.updated_at.desc())
+        .limit(safe_limit)
+        .all()
+    )
+    return [_serialize_process_history_item(job) for job in jobs]
+
+
+@app.get("/api/v1/process/{job_id}", response_model=ProcessJobResponse)
+async def get_process_job(
+    job_id: str,
+    current_user: User | None = Depends(get_current_user_optional),
+):
+    user_id = current_user.id if current_user else None
+    job = _get_process_job(job_id, user_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="任务不存在或已过期")
+
+    return job
+
+
+@app.delete("/api/v1/process/{job_id}")
+async def delete_process_job(
+    job_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    job = (
+        db.query(ResumeProcessJob)
+        .filter(
+            ResumeProcessJob.job_id == job_id,
+            ResumeProcessJob.user_id == current_user.id,
+        )
+        .first()
+    )
+    if job is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+
+    if job.status == "running":
+        raise HTTPException(status_code=409, detail="任务正在处理中，暂时无法删除")
+
+    db.delete(job)
+    db.commit()
+    return {"success": True}
+
 
 @app.post("/api/v1/chat")
 async def chat_with_agent(
@@ -348,7 +1012,10 @@ async def chat_with_agent(
     current_user: User | None = Depends(get_current_user_optional),
     db: Session = Depends(get_db),
 ):
-    """意图驱动聊天接口：先判意图，再决定调用哪些工具与顺序"""
+    if not _feature_enabled("ENABLE_CHAT", True):
+        raise HTTPException(status_code=404, detail="聊天功能暂未开放")
+
+    # 意图驱动聊天接口：先判意图，再决定调用哪些工具与顺序
     try:
         # 获取环境变量中 MCP 爬虫服务器的地址
         mcp_url = os.environ.get("MCP_SERVER_URL", "http://mcp_crawler:8001/sse")

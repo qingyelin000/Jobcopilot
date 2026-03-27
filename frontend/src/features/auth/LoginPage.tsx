@@ -1,20 +1,19 @@
-import { zodResolver } from "@hookform/resolvers/zod";
 import { useMutation } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 import { useForm } from "react-hook-form";
 import { Navigate, useLocation, useNavigate } from "react-router-dom";
-import { z } from "zod";
 import { useAuth } from "../../shared/auth/AuthContext";
 
-const authSchema = z.object({
-  username: z.string().min(3, "用户名至少 3 个字符"),
-  password: z.string().min(6, "密码至少 6 个字符"),
-});
+type AuthMode = "login" | "register";
 
-type AuthFormValues = z.infer<typeof authSchema>;
+type AuthFormValues = {
+  username: string;
+  password: string;
+  confirmPassword: string;
+};
 
 export function LoginPage() {
-  const [mode, setMode] = useState<"login" | "register">("login");
+  const [mode, setMode] = useState<AuthMode>("login");
   const { authenticate, token } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
@@ -24,15 +23,15 @@ export function LoginPage() {
   }, [location.state]);
 
   const form = useForm<AuthFormValues>({
-    resolver: zodResolver(authSchema),
     defaultValues: {
       username: "",
       password: "",
+      confirmPassword: "",
     },
   });
 
-  const authMutation = useMutation<void, Error, AuthFormValues>({
-    mutationFn: async (values: AuthFormValues) => {
+  const authMutation = useMutation<void, Error, { username: string; password: string }>({
+    mutationFn: async (values) => {
       await authenticate(mode, values);
     },
     onSuccess: () => {
@@ -44,51 +43,68 @@ export function LoginPage() {
     return <Navigate to={redirectTarget} replace />;
   }
 
+  const handleModeChange = (nextMode: AuthMode) => {
+    setMode(nextMode);
+    authMutation.reset();
+    form.clearErrors();
+    form.setValue("password", "");
+    form.setValue("confirmPassword", "");
+  };
+
+  const handleSubmit = form.handleSubmit((values) => {
+    const username = values.username.trim();
+
+    if (mode === "register" && values.password !== values.confirmPassword) {
+      form.setError("confirmPassword", {
+        type: "validate",
+        message: "两次输入的密码不一致",
+      });
+      return;
+    }
+
+    form.clearErrors("confirmPassword");
+    authMutation.mutate({
+      username,
+      password: values.password,
+    });
+  });
+
   return (
-    <main className="auth-page">
-      <section className="auth-hero">
-        <span className="eyebrow">JobCopilot</span>
-        <h1>开始你的求职工作流</h1>
-        <p>登录后即可管理简历分析、岗位探索和个人偏好。</p>
+    <main className="auth-simple-page">
+      <section className="auth-simple-card">
+        <h1 className="auth-simple-brand">JobCopilot</h1>
 
-        <div className="auth-feature-grid">
-          <article className="auth-feature-card">
-            <strong>Resume Engine</strong>
-            <span>围绕目标 JD 输出分析、定制简历与求职信。</span>
-          </article>
-          <article className="auth-feature-card">
-            <strong>Jobs Copilot</strong>
-            <span>像聊天一样筛选岗位，支持定位授权和偏好保存。</span>
-          </article>
-          <article className="auth-feature-card">
-            <strong>Account Center</strong>
-            <span>集中管理账户信息、定位授权和个性化设置。</span>
-          </article>
-        </div>
-      </section>
-
-      <section className="auth-card">
-        <div className="auth-mode-switch">
+        <div className="auth-mode-switch auth-simple-switch">
           <button
-            className={mode === "login" ? "primary-button" : "ghost-button"}
+            className={mode === "login" ? "primary-button" : "secondary-button"}
             type="button"
-            onClick={() => setMode("login")}
+            onClick={() => handleModeChange("login")}
           >
             登录
           </button>
           <button
-            className={mode === "register" ? "primary-button" : "ghost-button"}
+            className={mode === "register" ? "primary-button" : "secondary-button"}
             type="button"
-            onClick={() => setMode("register")}
+            onClick={() => handleModeChange("register")}
           >
             注册
           </button>
         </div>
 
-        <form className="form-stack" onSubmit={form.handleSubmit((values) => authMutation.mutate(values))}>
+        <form className="form-stack" onSubmit={handleSubmit} noValidate>
           <label className="field">
             <span>用户名</span>
-            <input placeholder="例如 zhangsan" {...form.register("username")} />
+            <input
+              autoComplete="username"
+              placeholder="请输入用户名"
+              {...form.register("username", {
+                required: "请输入用户名",
+                minLength: {
+                  value: 3,
+                  message: "用户名至少 3 个字符",
+                },
+              })}
+            />
             {form.formState.errors.username ? (
               <small className="field-error">{form.formState.errors.username.message}</small>
             ) : null}
@@ -96,18 +112,44 @@ export function LoginPage() {
 
           <label className="field">
             <span>密码</span>
-            <input placeholder="至少 6 位" type="password" {...form.register("password")} />
+            <input
+              autoComplete={mode === "login" ? "current-password" : "new-password"}
+              placeholder="请输入密码"
+              type="password"
+              {...form.register("password", {
+                required: "请输入密码",
+                minLength: {
+                  value: 6,
+                  message: "密码至少 6 个字符",
+                },
+              })}
+            />
             {form.formState.errors.password ? (
               <small className="field-error">{form.formState.errors.password.message}</small>
             ) : null}
           </label>
 
-          {authMutation.error ? (
-            <div className="callout callout-danger">{authMutation.error.message}</div>
+          {mode === "register" ? (
+            <label className="field">
+              <span>确认密码</span>
+              <input
+                autoComplete="new-password"
+                placeholder="请再次输入密码"
+                type="password"
+                {...form.register("confirmPassword", {
+                  required: "请再次输入密码",
+                })}
+              />
+              {form.formState.errors.confirmPassword ? (
+                <small className="field-error">{form.formState.errors.confirmPassword.message}</small>
+              ) : null}
+            </label>
           ) : null}
 
+          {authMutation.error ? <div className="callout callout-danger">{authMutation.error.message}</div> : null}
+
           <button className="primary-button full-width" type="submit" disabled={authMutation.isPending}>
-            {authMutation.isPending ? "提交中..." : mode === "login" ? "进入工作台" : "创建账户"}
+            {authMutation.isPending ? "提交中..." : mode === "login" ? "登录" : "注册"}
           </button>
         </form>
       </section>

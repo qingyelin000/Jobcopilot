@@ -1,10 +1,29 @@
-version: '3.8'
-
 services:
+  mysql:
+    image: mysql:8.4
+    container_name: jobcopilot_mysql_dev
+    restart: unless-stopped
+    environment:
+      - MYSQL_DATABASE=${MYSQL_DATABASE}
+      - MYSQL_USER=${MYSQL_USER}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD}
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD}
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    volumes:
+      - mysql_dev_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
   # === 1. 核心 AI 中枢控制服务 ===
   backend:
     build: ./backend
     container_name: jobcopilot_backend
+    command: uvicorn api:app --host 0.0.0.0 --port 8000 --reload
     ports:
       - "8000:8000"
     volumes:
@@ -12,6 +31,12 @@ services:
     environment:
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
       - OPENAI_BASE_URL=${OPENAI_BASE_URL}
+      - MIMO_API_KEY=${MIMO_API_KEY:-}
+      - MIMO_V2_PRO_API_KEY=${MIMO_V2_PRO_API_KEY:-}
+      - MIMO_BASE_URL=${MIMO_BASE_URL:-https://api.xiaomimimo.com/v1}
+      - MIMO_MODEL=${MIMO_MODEL:-mimo-v2-pro}
+      - MIMO_MAP_MODEL=${MIMO_MAP_MODEL:-}
+      - MIMO_REWRITE_MODEL=${MIMO_REWRITE_MODEL:-}
       - MCP_SERVER_URL=http://mcp_server:8001/sse # 向后端告知爬虫节点的内部地址
       - DATABASE_URL=${DATABASE_URL}
       - JWT_SECRET=${JWT_SECRET}
@@ -20,7 +45,10 @@ services:
       - GEO_TENCENT_KEY=${GEO_TENCENT_KEY}
       - FRONTEND_ORIGINS=http://localhost:5173,http://127.0.0.1:5173,http://localhost:8501,http://127.0.0.1:8501
     depends_on:
-      - mcp_server
+      mysql:
+        condition: service_healthy
+      mcp_server:
+        condition: service_started
     restart: unless-stopped
 
   # === 2. MCP Server (提供获取位置、爬取Boss直聘工具) ===
@@ -40,10 +68,17 @@ services:
 
   # === 3. 大屏前端服务 ===
   frontend:
-    build: ./frontend
+    build:
+      context: ./frontend
+      args:
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmjs.org/}
+        NPM_REGISTRY_FALLBACK: ${NPM_REGISTRY_FALLBACK:-https://registry.npmmirror.com/}
     container_name: jobcopilot_frontend
     ports:
       - "8501:80"
     depends_on:
       - backend
     restart: unless-stopped
+
+volumes:
+  mysql_dev_data:

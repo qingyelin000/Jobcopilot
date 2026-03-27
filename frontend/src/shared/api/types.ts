@@ -7,6 +7,45 @@ export type UserProfile = {
   id: number;
   username: string;
   location_consent: boolean;
+  full_name?: string | null;
+  email?: string | null;
+  phone?: string | null;
+  city?: string | null;
+  target_role?: string | null;
+  profile_summary?: string | null;
+};
+
+export type DocumentStatus = "processing" | "ready" | "error";
+
+export type ResumeDocumentSummary = {
+  id: number;
+  title: string;
+  source_filename?: string | null;
+  status: DocumentStatus;
+  error?: string | null;
+  is_active: boolean;
+  char_count: number;
+  created_at: string;
+  updated_at: string;
+};
+
+export type ResumeDocumentDetail = ResumeDocumentSummary & {
+  source_text: string;
+};
+
+export type JDDocumentSummary = {
+  id: number;
+  title: string;
+  status: DocumentStatus;
+  error?: string | null;
+  is_active: boolean;
+  char_count: number;
+  created_at: string;
+  updated_at: string;
+};
+
+export type JDDocumentDetail = JDDocumentSummary & {
+  source_text: string;
 };
 
 export type ProjectExperience = {
@@ -62,14 +101,40 @@ export type OptimizedResume = {
   optimized_projects: OptimizedProject[];
 };
 
+export type ProcessData = {
+  user_info: UserInfo;
+  jd_info: JDInfo;
+  match_mapping: ResumeJDMapping;
+  optimized_resume: OptimizedResume;
+};
+
+export type PartialProcessData = Partial<ProcessData>;
+
 export type ProcessResponse = {
   status: string;
-  data: {
-    user_info: UserInfo;
-    jd_info: JDInfo;
-    match_mapping: ResumeJDMapping;
-    optimized_resume: OptimizedResume;
-  };
+  data: ProcessData;
+};
+
+export type ProcessJobStatus = {
+  job_id: string;
+  status: "running" | "success" | "error";
+  stage: "parsing" | "mapping" | "rewriting" | "done" | "error";
+  progress: number;
+  message: string;
+  data?: PartialProcessData | null;
+  error?: string | null;
+};
+
+export type ProcessHistoryItem = {
+  job_id: string;
+  status: "running" | "success" | "error";
+  stage: "parsing" | "mapping" | "rewriting" | "done" | "error";
+  progress: number;
+  message: string;
+  headline: string;
+  subtitle?: string | null;
+  created_at: string;
+  updated_at: string;
 };
 
 export type ChatResponse = {
