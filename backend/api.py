@@ -3,10 +3,12 @@ from contextlib import AsyncExitStack
 from datetime import datetime
 import hashlib
 from io import BytesIO
+from threading import Lock
+from typing import Any
 import uuid
 from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import agents
 import os
 import json
@@ -33,7 +35,16 @@ from auth_schemas import (
     UserProfileUpdate,
 )
 from db import Base, SessionLocal, engine, get_db
-from models import JDDocument, ResumeDocument, ResumeProcessJob, User
+from interview.embedding_utils import default_embedding_provider_name
+from interview.retriever_v1 import DEFAULT_DATASET_PATH, RetrieverV1, serialize_retrieved_question
+from models import (
+    JDDocument,
+    InterviewSession,
+    InterviewTurn,
+    ResumeDocument,
+    ResumeProcessJob,
+    User,
+)
 from schemas import JDInfo, UserInfo
 
 app = FastAPI(title="JobCopilot API Backend")
@@ -146,6 +157,449 @@ class ChatRequest(BaseModel):
     user_city: str | None = None
     latitude: float | None = None
     longitude: float | None = None
+
+
+class InterviewSessionStartRequest(BaseModel):
+    resume_id: int = Field(ge=1)
+    jd_id: int = Field(ge=1)
+    backend: str | None = None
+    strict_metadata_filter: bool | None = None
+
+
+class InterviewSessionStartResponse(BaseModel):
+    session_id: str
+    status: str
+    backend: str
+    current_round: int
+    max_rounds: int
+    question: dict[str, Any]
+
+
+class InterviewAnswerRequest(BaseModel):
+    answer_text: str = Field(min_length=1)
+
+
+class InterviewAnswerResponse(BaseModel):
+    session_id: str
+    status: str
+    current_round: int
+    max_rounds: int
+    evaluation: dict[str, Any]
+    next_question: dict[str, Any] | None = None
+    summary: dict[str, Any] | None = None
+
+
+class InterviewSummaryResponse(BaseModel):
+    session_id: str
+    status: str
+    current_round: int
+    max_rounds: int
+    summary: dict[str, Any]
+    turns: list[dict[str, Any]]
+
+
+DEFAULT_RETRIEVER_BACKEND = (
+    os.getenv("RETRIEVER_BACKEND", "v2").strip().lower() or "v2"
+)
+_RETRIEVER_CACHE: dict[str, Any] = {}
+_RETRIEVER_LOCK = Lock()
+
+
+class InterviewRetrieveRequest(BaseModel):
+    query: str = ""
+    resume_text: str = ""
+    jd_text: str = ""
+    top_k: int = Field(default=20, ge=1, le=20)
+    target_company: str | None = None
+    target_role: str | None = None
+    backend: str | None = None
+    strict_metadata_filter: bool | None = None
+
+
+class InterviewRetrieveResponse(BaseModel):
+    backend: str
+    top_k: int
+    result_count: int
+    results: list[dict[str, Any]]
+
+
+def _safe_int_from_env(name: str, default: int, minimum: int | None = None) -> int:
+    raw_value = os.getenv(name)
+    if raw_value is None or not str(raw_value).strip():
+        value = int(default)
+    else:
+        try:
+            value = int(str(raw_value).strip())
+        except ValueError:
+            value = int(default)
+    if minimum is not None:
+        value = max(value, int(minimum))
+    return value
+
+
+INTERVIEW_TOP_K = min(_safe_int_from_env("INTERVIEW_TOP_K", 20, minimum=1), 20)
+INTERVIEW_MAX_ROUNDS = _safe_int_from_env("INTERVIEW_MAX_ROUNDS", 0, minimum=0)
+
+
+def _normalize_retriever_backend(value: str | None) -> str:
+    backend = (value or DEFAULT_RETRIEVER_BACKEND or "v2").strip().lower()
+    if backend not in {"v1", "v2"}:
+        raise ValueError("Invalid backend. Use one of: v1, v2.")
+    return backend
+
+
+def _load_ready_resume_document(
+    db: Session,
+    *,
+    user_id: int,
+    resume_id: int,
+) -> ResumeDocument:
+    document = (
+        db.query(ResumeDocument)
+        .filter(
+            ResumeDocument.id == resume_id,
+            ResumeDocument.user_id == user_id,
+        )
+        .first()
+    )
+    if document is None:
+        raise HTTPException(status_code=404, detail="Resume document not found.")
+    if document.status != "ready":
+        raise HTTPException(status_code=409, detail="Selected resume is not ready yet.")
+    if not str(document.source_text or "").strip():
+        raise HTTPException(status_code=409, detail="Selected resume has empty content.")
+    return document
+
+
+def _load_ready_jd_document(
+    db: Session,
+    *,
+    user_id: int,
+    jd_id: int,
+) -> JDDocument:
+    document = (
+        db.query(JDDocument)
+        .filter(
+            JDDocument.id == jd_id,
+            JDDocument.user_id == user_id,
+        )
+        .first()
+    )
+    if document is None:
+        raise HTTPException(status_code=404, detail="JD document not found.")
+    if document.status != "ready":
+        raise HTTPException(status_code=409, detail="Selected JD is not ready yet.")
+    if not str(document.source_text or "").strip():
+        raise HTTPException(status_code=409, detail="Selected JD has empty content.")
+    return document
+
+
+def _resolve_session_targets(
+    *,
+    current_user: User,
+    jd_document: JDDocument,
+) -> tuple[str, str]:
+    parsed_jd = jd_document.parsed_json if isinstance(jd_document.parsed_json, dict) else {}
+    target_company = str(parsed_jd.get("company_name") or "").strip()
+    target_role = str(parsed_jd.get("job_title") or "").strip()
+
+    if not target_role:
+        target_role = str(current_user.target_role or "").strip()
+    return target_company, target_role
+
+
+def _compose_interview_query(
+    *,
+    target_company: str,
+    target_role: str,
+    jd_title: str,
+) -> str:
+    query_parts: list[str] = []
+    for value in (target_company, target_role, jd_title):
+        item = str(value or "").strip()
+        if item and item not in query_parts:
+            query_parts.append(item)
+    return " ".join(query_parts)
+
+
+def _build_retriever_v1() -> RetrieverV1:
+    dataset_path = (
+        os.getenv("RETRIEVER_DATASET_PATH", str(DEFAULT_DATASET_PATH)).strip()
+        or str(DEFAULT_DATASET_PATH)
+    )
+    return RetrieverV1(dataset_path=dataset_path)
+
+
+def _build_retriever_v2() -> Any:
+    from interview.retriever_v2 import DEFAULT_QDRANT_COLLECTION, DEFAULT_QDRANT_URL, RetrieverV2
+
+    dataset_path = (
+        os.getenv("RETRIEVER_DATASET_PATH", str(DEFAULT_DATASET_PATH)).strip()
+        or str(DEFAULT_DATASET_PATH)
+    )
+    qdrant_url = os.getenv("QDRANT_URL", DEFAULT_QDRANT_URL).strip() or DEFAULT_QDRANT_URL
+    if os.path.exists("/.dockerenv"):
+        qdrant_url = qdrant_url.replace("://localhost", "://qdrant").replace("://127.0.0.1", "://qdrant")
+    embedding_provider = (
+        os.getenv("EMBEDDING_PROVIDER", "").strip().lower()
+        or default_embedding_provider_name()
+    )
+    return RetrieverV2(
+        dataset_path=dataset_path,
+        qdrant_url=qdrant_url,
+        qdrant_api_key=os.getenv("QDRANT_API_KEY", "").strip() or None,
+        collection_name=os.getenv("QDRANT_COLLECTION", DEFAULT_QDRANT_COLLECTION).strip()
+        or DEFAULT_QDRANT_COLLECTION,
+        embedding_provider=embedding_provider,
+        embedding_model=os.getenv("EMBEDDING_MODEL", "").strip() or None,
+        embedding_api_key=os.getenv("EMBEDDING_API_KEY", "").strip() or None,
+        embedding_base_url=os.getenv("EMBEDDING_BASE_URL", "").strip() or None,
+        embedding_dimension=_safe_int_from_env("EMBEDDING_DIMENSION", 384, minimum=1),
+        vector_candidate_pool=_safe_int_from_env("RETRIEVER_V2_VECTOR_POOL", 64, minimum=8),
+        lexical_candidate_pool=_safe_int_from_env("RETRIEVER_V2_LEXICAL_POOL", 40, minimum=8),
+        strict_metadata_filter=_feature_enabled("RETRIEVER_V2_STRICT_METADATA_FILTER", default=False),
+    )
+
+
+def _get_retriever(backend: str) -> Any:
+    with _RETRIEVER_LOCK:
+        cached = _RETRIEVER_CACHE.get(backend)
+        if cached is not None:
+            return cached
+        retriever = _build_retriever_v2() if backend == "v2" else _build_retriever_v1()
+        _RETRIEVER_CACHE[backend] = retriever
+        return retriever
+
+
+def _normalize_question_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "question_id": str(payload.get("question_id") or "").strip(),
+        "source_content_id": str(payload.get("source_content_id") or "").strip(),
+        "company": str(payload.get("company") or "").strip(),
+        "role": str(payload.get("role") or "").strip(),
+        "section": payload.get("section"),
+        "publish_time": payload.get("publish_time"),
+        "question_text": str(payload.get("question_text") or "").strip(),
+        "question_type": str(payload.get("question_type") or "general").strip() or "general",
+    }
+
+
+def _fallback_interview_question(candidates: list[dict[str, Any]], *, turn_index: int) -> dict[str, Any]:
+    if candidates:
+        first = _normalize_question_payload(candidates[0])
+        first["ask_mode"] = "new_question"
+        first["reason"] = "fallback_first_candidate"
+        return first
+    return {
+        "question_id": f"generated::fallback::{turn_index}",
+        "source_content_id": "",
+        "company": "",
+        "role": "",
+        "section": None,
+        "publish_time": None,
+        "question_text": "请你介绍一个最有挑战的项目，并重点说明技术难点与解决方案。",
+        "question_type": "project_or_system_design",
+        "ask_mode": "new_question",
+        "reason": "fallback_default_question",
+    }
+
+
+def _pick_interviewer_question(
+    *,
+    query: str,
+    target_company: str,
+    target_role: str,
+    resume_text: str,
+    jd_text: str,
+    candidate_questions: list[dict[str, Any]],
+    history_turns: list[dict[str, Any]],
+    follow_up_hint: str | None = None,
+    turn_index: int,
+) -> dict[str, Any]:
+    asked_ids = {
+        str((item.get("question") or {}).get("question_id") or "").strip()
+        for item in history_turns
+    }
+    available = [
+        _normalize_question_payload(item)
+        for item in candidate_questions
+        if str(item.get("question_id") or "").strip() not in asked_ids
+    ]
+    if not available:
+        available = [_normalize_question_payload(item) for item in candidate_questions]
+
+    try:
+        picked = agents.interviewer_agent_pick_question(
+            query=query,
+            target_company=target_company,
+            target_role=target_role,
+            resume_text=resume_text,
+            jd_text=jd_text,
+            candidate_questions=available,
+            history_turns=history_turns,
+            follow_up_hint=follow_up_hint,
+            turn_index=turn_index,
+        )
+    except Exception:
+        return _fallback_interview_question(available, turn_index=turn_index)
+
+    allowed_question_types = {
+        "project_or_system_design",
+        "backend_foundation",
+        "coding",
+        "behavioral",
+        "general",
+    }
+    picked_id = str(picked.get("question_id") or "").strip()
+    picked_text = str(picked.get("question_text") or "").strip()
+    picked_mode = str(picked.get("mode") or "new_question").strip().lower()
+    picked_reason = str(picked.get("reason") or "").strip()
+    picked_question_type = str(picked.get("question_type") or "").strip()
+    picked_reference_id = str(picked.get("reference_question_id") or "").strip()
+    if picked_question_type not in allowed_question_types:
+        picked_question_type = ""
+
+    for item in available:
+        if picked_id and item.get("question_id") == picked_id:
+            selected = dict(item)
+            if picked_text:
+                # Allow the interviewer agent to rewrite retrieved questions instead of copying verbatim.
+                selected["question_text"] = picked_text
+            if picked_question_type:
+                selected["question_type"] = picked_question_type
+            selected["ask_mode"] = picked_mode or "new_question"
+            selected["reason"] = picked_reason
+            if picked_reference_id:
+                selected["reference_question_id"] = picked_reference_id
+            return selected
+    for item in available:
+        if picked_text and item.get("question_text") == picked_text:
+            selected = dict(item)
+            if picked_question_type:
+                selected["question_type"] = picked_question_type
+            selected["ask_mode"] = picked_mode or "new_question"
+            selected["reason"] = picked_reason
+            if picked_reference_id:
+                selected["reference_question_id"] = picked_reference_id
+            return selected
+
+    for item in available:
+        if picked_reference_id and item.get("question_id") == picked_reference_id:
+            selected = dict(item)
+            selected["question_id"] = picked_id or f"generated::reference::{turn_index}"
+            if picked_text:
+                selected["question_text"] = picked_text
+            if picked_question_type:
+                selected["question_type"] = picked_question_type
+            selected["ask_mode"] = picked_mode if picked_mode in {"new_question", "follow_up"} else "new_question"
+            selected["reason"] = picked_reason or "generated_from_reference_question"
+            selected["reference_question_id"] = picked_reference_id
+            return selected
+
+    if picked_text:
+        inferred_type = picked_question_type or (
+            "project_or_system_design" if int(turn_index) <= 2 else "general"
+        )
+        return {
+            "question_id": f"generated::followup::{turn_index}",
+            "source_content_id": "",
+            "company": target_company,
+            "role": target_role,
+            "section": None,
+            "publish_time": None,
+            "question_text": picked_text,
+            "question_type": inferred_type,
+            "ask_mode": picked_mode if picked_mode in {"new_question", "follow_up"} else "follow_up",
+            "reason": picked_reason or "generated_by_interviewer_agent",
+            "reference_question_id": picked_reference_id or None,
+        }
+
+    return _fallback_interview_question(available, turn_index=turn_index)
+
+
+def _serialize_interview_turn(turn: InterviewTurn) -> dict[str, Any]:
+    return {
+        "turn_index": int(turn.turn_index),
+        "question": turn.question_json or {},
+        "answer_text": turn.answer_text or "",
+        "evaluation": turn.evaluation_json or None,
+        "created_at": turn.created_at.isoformat() if turn.created_at else None,
+    }
+
+
+def _fallback_interview_summary(turns: list[InterviewTurn]) -> dict[str, Any]:
+    if not turns:
+        return {
+            "overall_score": 0.0,
+            "dimension_scores": {
+                "accuracy": 0.0,
+                "depth": 0.0,
+                "structure": 0.0,
+                "resume_fit": 0.0,
+            },
+            "strengths": [],
+            "improvements": ["先完成至少一轮问答再生成总结。"],
+            "summary": "当前暂无可评估的面试回答。",
+        }
+
+    keys = ("accuracy", "depth", "structure", "resume_fit", "overall")
+    values: dict[str, list[float]] = {key: [] for key in keys}
+    for turn in turns:
+        evaluation = turn.evaluation_json or {}
+        scores = evaluation.get("scores") or {}
+        for key in keys:
+            raw = scores.get(key)
+            if isinstance(raw, (int, float)):
+                values[key].append(float(raw))
+
+    def avg(key: str) -> float:
+        items = values.get(key) or []
+        if not items:
+            return 0.0
+        return round(sum(items) / len(items), 2)
+
+    overall = avg("overall")
+    return {
+        "overall_score": overall,
+        "dimension_scores": {
+            "accuracy": avg("accuracy"),
+            "depth": avg("depth"),
+            "structure": avg("structure"),
+            "resume_fit": avg("resume_fit"),
+        },
+        "strengths": [],
+        "improvements": ["可补充更多技术细节与权衡过程，提高回答深度。"],
+        "summary": f"共完成 {len(turns)} 轮，当前综合得分 {overall}。",
+    }
+
+
+def _build_interview_summary(session: InterviewSession, turns: list[InterviewTurn]) -> dict[str, Any]:
+    serialized_turns = [_serialize_interview_turn(item) for item in turns]
+    try:
+        return agents.evaluator_agent_build_summary(
+            turns=serialized_turns,
+            target_company=str(session.target_company or ""),
+            target_role=str(session.target_role or ""),
+        )
+    except Exception:
+        return _fallback_interview_summary(turns)
+
+
+def _finalize_interview_session(
+    *,
+    session: InterviewSession,
+    turns: list[InterviewTurn],
+    db: Session,
+) -> dict[str, Any]:
+    summary = session.summary_json
+    if not summary:
+        summary = _build_interview_summary(session, turns)
+    session.status = "done"
+    session.summary_json = summary
+    session.current_question_json = None
+    db.add(session)
+    db.commit()
+    return summary
 
 
 def _normalize_city(city: str | None) -> str:
@@ -881,6 +1335,411 @@ async def parse_resume_pdf(file: UploadFile = File(...)):
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"PDF 解析失败: {exc}") from exc
 
+@app.post("/api/v1/interview/retrieve", response_model=InterviewRetrieveResponse)
+async def retrieve_interview_questions(req: InterviewRetrieveRequest):
+    if not (req.query.strip() or req.resume_text.strip() or req.jd_text.strip()):
+        raise HTTPException(
+            status_code=400,
+            detail="At least one of query/resume_text/jd_text is required.",
+        )
+
+    try:
+        backend = _normalize_retriever_backend(req.backend)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    top_k = max(1, min(int(req.top_k), 20))
+    try:
+        retriever = _get_retriever(backend)
+        if backend == "v2":
+            results = retriever.search(
+                resume_text=req.resume_text,
+                jd_text=req.jd_text,
+                top_k=top_k,
+                extra_query=req.query or None,
+                target_company=(req.target_company or "").strip() or None,
+                target_role=(req.target_role or "").strip() or None,
+                strict_metadata_filter=req.strict_metadata_filter,
+            )
+        else:
+            results = retriever.search(
+                resume_text=req.resume_text,
+                jd_text=req.jd_text,
+                top_k=top_k,
+                extra_query=req.query or None,
+            )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=500, detail=f"Retriever dataset not found: {exc}") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Retriever '{backend}' failed: {exc}") from exc
+
+    serialized_results = [serialize_retrieved_question(item) for item in results]
+    return InterviewRetrieveResponse(
+        backend=backend,
+        top_k=top_k,
+        result_count=len(serialized_results),
+        results=serialized_results,
+    )
+
+
+@app.post("/api/v1/interview/sessions/start", response_model=InterviewSessionStartResponse)
+async def start_interview_session(
+    req: InterviewSessionStartRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    try:
+        backend = _normalize_retriever_backend(req.backend)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    resume_document = _load_ready_resume_document(
+        db,
+        user_id=current_user.id,
+        resume_id=int(req.resume_id),
+    )
+    jd_document = _load_ready_jd_document(
+        db,
+        user_id=current_user.id,
+        jd_id=int(req.jd_id),
+    )
+    resume_text = str(resume_document.source_text or "")
+    jd_text = str(jd_document.source_text or "")
+    target_company, target_role = _resolve_session_targets(
+        current_user=current_user,
+        jd_document=jd_document,
+    )
+    query_text = _compose_interview_query(
+        target_company=target_company,
+        target_role=target_role,
+        jd_title=str(jd_document.title or ""),
+    )
+
+    top_k = INTERVIEW_TOP_K
+    max_rounds = INTERVIEW_MAX_ROUNDS
+
+    try:
+        retriever = _get_retriever(backend)
+        if backend == "v2":
+            results = retriever.search(
+                resume_text=resume_text,
+                jd_text=jd_text,
+                top_k=top_k,
+                extra_query=query_text or None,
+                target_company=target_company or None,
+                target_role=target_role or None,
+                strict_metadata_filter=req.strict_metadata_filter,
+            )
+        else:
+            results = retriever.search(
+                resume_text=resume_text,
+                jd_text=jd_text,
+                top_k=top_k,
+                extra_query=query_text or None,
+            )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Interview retriever failed: {exc}") from exc
+
+    candidate_questions = [serialize_retrieved_question(item) for item in results]
+    first_question = _pick_interviewer_question(
+        query=query_text,
+        target_company=target_company,
+        target_role=target_role,
+        resume_text=resume_text,
+        jd_text=jd_text,
+        candidate_questions=candidate_questions,
+        history_turns=[],
+        follow_up_hint=None,
+        turn_index=1,
+    )
+
+    session = InterviewSession(
+        session_id=uuid.uuid4().hex,
+        user_id=current_user.id,
+        status="asking",
+        backend=backend,
+        top_k=top_k,
+        max_rounds=max_rounds,
+        current_round=1,
+        query=query_text,
+        resume_text=resume_text,
+        jd_text=jd_text,
+        target_company=target_company or None,
+        target_role=target_role or None,
+        current_question_json=first_question,
+        summary_json=None,
+    )
+    turn = InterviewTurn(
+        session_id=session.session_id,
+        turn_index=1,
+        question_json=first_question,
+        answer_text=None,
+        evaluation_json=None,
+    )
+    db.add(session)
+    db.add(turn)
+    db.commit()
+
+    return InterviewSessionStartResponse(
+        session_id=session.session_id,
+        status=session.status,
+        backend=session.backend,
+        current_round=int(session.current_round),
+        max_rounds=int(session.max_rounds),
+        question=first_question,
+    )
+
+
+@app.post("/api/v1/interview/sessions/{session_id}/answer", response_model=InterviewAnswerResponse)
+async def answer_interview_session(
+    session_id: str,
+    req: InterviewAnswerRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    query = (
+        db.query(InterviewSession)
+        .filter(
+            InterviewSession.session_id == session_id,
+            InterviewSession.user_id == current_user.id,
+        )
+    )
+    session = query.first()
+    if session is None:
+        raise HTTPException(status_code=404, detail="Interview session not found.")
+
+    if session.status == "done":
+        return InterviewAnswerResponse(
+            session_id=session.session_id,
+            status=session.status,
+            current_round=int(session.current_round),
+            max_rounds=int(session.max_rounds),
+            evaluation={"message": "Session already finished."},
+            summary=session.summary_json or {},
+            next_question=None,
+        )
+
+    current_question = session.current_question_json or {}
+    current_question_text = str(current_question.get("question_text") or "").strip()
+    if not current_question_text:
+        raise HTTPException(status_code=409, detail="Current interview question is missing.")
+
+    turn = (
+        db.query(InterviewTurn)
+        .filter(
+            InterviewTurn.session_id == session.session_id,
+            InterviewTurn.turn_index == session.current_round,
+        )
+        .order_by(InterviewTurn.id.desc())
+        .first()
+    )
+    if turn is None:
+        turn = InterviewTurn(
+            session_id=session.session_id,
+            turn_index=int(session.current_round),
+            question_json=current_question,
+        )
+
+    answer_text = req.answer_text.strip()
+    turn.answer_text = answer_text
+
+    try:
+        evaluation = agents.evaluator_agent_evaluate_answer(
+            question_text=current_question_text,
+            answer_text=answer_text,
+            resume_text=str(session.resume_text or ""),
+            jd_text=str(session.jd_text or ""),
+            turn_index=int(session.current_round),
+            max_rounds=int(session.max_rounds),
+            target_company=str(session.target_company or ""),
+            target_role=str(session.target_role or ""),
+        )
+    except Exception:
+        evaluation = {
+            "scores": {
+                "accuracy": 60.0,
+                "depth": 60.0,
+                "structure": 60.0,
+                "resume_fit": 60.0,
+                "overall": 60.0,
+            },
+            "strengths": [],
+            "improvements": ["补充关键技术细节和设计取舍。"],
+            "feedback": "本轮回答已记录，建议补充更多技术细节。",
+            "decision": "next_question",
+            "follow_up_hint": "",
+        }
+
+    decision = str(evaluation.get("decision") or "next_question").strip().lower()
+    if decision not in {"follow_up", "next_question", "finish"}:
+        decision = "next_question"
+    if int(session.max_rounds or 0) > 0 and int(session.current_round) >= int(session.max_rounds):
+        decision = "finish"
+
+    turn.evaluation_json = evaluation
+    db.add(turn)
+
+    if decision == "finish":
+        turns = (
+            db.query(InterviewTurn)
+            .filter(InterviewTurn.session_id == session.session_id)
+            .order_by(InterviewTurn.turn_index.asc(), InterviewTurn.id.asc())
+            .all()
+        )
+        summary = _finalize_interview_session(session=session, turns=turns, db=db)
+        return InterviewAnswerResponse(
+            session_id=session.session_id,
+            status=session.status,
+            current_round=int(session.current_round),
+            max_rounds=int(session.max_rounds),
+            evaluation=evaluation,
+            summary=summary,
+            next_question=None,
+        )
+
+    history_turns = (
+        db.query(InterviewTurn)
+        .filter(InterviewTurn.session_id == session.session_id)
+        .order_by(InterviewTurn.turn_index.asc(), InterviewTurn.id.asc())
+        .all()
+    )
+    serialized_history = [_serialize_interview_turn(item) for item in history_turns]
+
+    candidate_questions: list[dict[str, Any]] = []
+    try:
+        retriever = _get_retriever(str(session.backend or "v2"))
+        if str(session.backend or "v2") == "v2":
+            next_results = retriever.search(
+                resume_text=str(session.resume_text or ""),
+                jd_text=str(session.jd_text or ""),
+                top_k=int(session.top_k or 8),
+                extra_query=str(session.query or "") or None,
+                target_company=str(session.target_company or "") or None,
+                target_role=str(session.target_role or "") or None,
+                strict_metadata_filter=False,
+            )
+        else:
+            next_results = retriever.search(
+                resume_text=str(session.resume_text or ""),
+                jd_text=str(session.jd_text or ""),
+                top_k=int(session.top_k or 8),
+                extra_query=str(session.query or "") or None,
+            )
+        candidate_questions = [serialize_retrieved_question(item) for item in next_results]
+    except Exception:
+        candidate_questions = []
+
+    next_round = int(session.current_round) + 1
+    next_question = _pick_interviewer_question(
+        query=str(session.query or ""),
+        target_company=str(session.target_company or ""),
+        target_role=str(session.target_role or ""),
+        resume_text=str(session.resume_text or ""),
+        jd_text=str(session.jd_text or ""),
+        candidate_questions=candidate_questions,
+        history_turns=serialized_history,
+        follow_up_hint=str(evaluation.get("follow_up_hint") or "") if decision == "follow_up" else None,
+        turn_index=next_round,
+    )
+
+    next_turn = InterviewTurn(
+        session_id=session.session_id,
+        turn_index=next_round,
+        question_json=next_question,
+        answer_text=None,
+        evaluation_json=None,
+    )
+    session.current_round = next_round
+    session.current_question_json = next_question
+    session.status = "asking"
+    db.add(next_turn)
+    db.add(session)
+    db.commit()
+
+    return InterviewAnswerResponse(
+        session_id=session.session_id,
+        status=session.status,
+        current_round=int(session.current_round),
+        max_rounds=int(session.max_rounds),
+        evaluation=evaluation,
+        summary=None,
+        next_question=next_question,
+    )
+
+
+@app.get("/api/v1/interview/sessions/{session_id}/summary", response_model=InterviewSummaryResponse)
+async def get_interview_session_summary(
+    session_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    query = (
+        db.query(InterviewSession)
+        .filter(
+            InterviewSession.session_id == session_id,
+            InterviewSession.user_id == current_user.id,
+        )
+    )
+    session = query.first()
+    if session is None:
+        raise HTTPException(status_code=404, detail="Interview session not found.")
+
+    turns = (
+        db.query(InterviewTurn)
+        .filter(InterviewTurn.session_id == session.session_id)
+        .order_by(InterviewTurn.turn_index.asc(), InterviewTurn.id.asc())
+        .all()
+    )
+    if not session.summary_json:
+        session.summary_json = _build_interview_summary(session, turns)
+        db.add(session)
+        db.commit()
+
+    return InterviewSummaryResponse(
+        session_id=session.session_id,
+        status=session.status,
+        current_round=int(session.current_round),
+        max_rounds=int(session.max_rounds),
+        summary=session.summary_json or _fallback_interview_summary(turns),
+        turns=[_serialize_interview_turn(item) for item in turns],
+    )
+
+
+@app.post("/api/v1/interview/sessions/{session_id}/finish", response_model=InterviewSummaryResponse)
+async def finish_interview_session(
+    session_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    query = (
+        db.query(InterviewSession)
+        .filter(
+            InterviewSession.session_id == session_id,
+            InterviewSession.user_id == current_user.id,
+        )
+    )
+    session = query.first()
+    if session is None:
+        raise HTTPException(status_code=404, detail="Interview session not found.")
+
+    turns = (
+        db.query(InterviewTurn)
+        .filter(InterviewTurn.session_id == session.session_id)
+        .order_by(InterviewTurn.turn_index.asc(), InterviewTurn.id.asc())
+        .all()
+    )
+    summary = _finalize_interview_session(session=session, turns=turns, db=db)
+
+    return InterviewSummaryResponse(
+        session_id=session.session_id,
+        status=session.status,
+        current_round=int(session.current_round),
+        max_rounds=int(session.max_rounds),
+        summary=summary or _fallback_interview_summary(turns),
+        turns=[_serialize_interview_turn(item) for item in turns],
+    )
+
+
 @app.post("/api/v1/process")
 async def process_job_application(
     req: ProcessRequest,
@@ -1018,7 +1877,7 @@ async def chat_with_agent(
     # 意图驱动聊天接口：先判意图，再决定调用哪些工具与顺序
     try:
         # 获取环境变量中 MCP 爬虫服务器的地址
-        mcp_url = os.environ.get("MCP_SERVER_URL", "http://mcp_crawler:8001/sse")
+        mcp_url = os.environ.get("MCP_SERVER_URL", "http://mcp_server:8001/sse")
         
         async with AsyncExitStack() as stack:
             # 1. 建立与爬虫微服务节点的 SSE 远程连接！
@@ -1132,4 +1991,3 @@ async def chat_with_agent(
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
-

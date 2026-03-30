@@ -1,0 +1,12 @@
+{
+  "min_total_count": 50,
+  "max_duplicate_rate": 0.12,
+  "max_missing_normalized_key_rate": 0.02,
+  "max_general_ratio": 0.65,
+  "question_type_min_ratio": {
+    "coding": 0.08,
+    "backend_foundation": 0.08,
+    "project_or_system_design": 0.05,
+    "behavioral": 0.03
+  }
+}

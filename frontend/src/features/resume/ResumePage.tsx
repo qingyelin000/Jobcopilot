@@ -258,7 +258,7 @@ export function ResumePage() {
               {resumeSourceMode === "library" ? (
                 <LibrarySourcePanel
                   ctaHref="/app/profile"
-                  ctaLabel="去个人信息查看简历"
+                  ctaLabel="去个人信息更换简历"
                   error={activeResume?.status === "error" ? activeResume.error || "该简历解析失败，请重新处理。" : null}
                   isLoading={activeResumeDetailQuery.isLoading}
                   title={activeResume?.title || null}
@@ -298,7 +298,7 @@ export function ResumePage() {
               {jdSourceMode === "library" ? (
                 <LibrarySourcePanel
                   ctaHref="/app/profile"
-                  ctaLabel="去个人信息查看 JD"
+                  ctaLabel="去个人信息更换 JD"
                   error={activeJd?.status === "error" ? activeJd.error || "该 JD 解析失败，请重新处理。" : null}
                   isLoading={activeJdDetailQuery.isLoading}
                   title={activeJd?.title || null}

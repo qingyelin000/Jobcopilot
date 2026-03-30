@@ -1,6 +1,10 @@
 import type {
   ChatRequest,
   ChatResponse,
+  InterviewAnswerResponse,
+  InterviewSessionStartRequest,
+  InterviewSessionStartResponse,
+  InterviewSessionSummaryResponse,
   JDDocumentDetail,
   JDDocumentSummary,
   ParsePdfResponse,
@@ -213,5 +217,26 @@ export const api = {
       method: "POST",
       token,
       body: JSON.stringify(payload),
+    }),
+  startInterviewSession: (token: string | null, payload: InterviewSessionStartRequest) =>
+    request<InterviewSessionStartResponse>("/api/v1/interview/sessions/start", {
+      method: "POST",
+      token,
+      body: JSON.stringify(payload),
+    }),
+  answerInterviewSession: (token: string | null, sessionId: string, payload: { answer_text: string }) =>
+    request<InterviewAnswerResponse>(`/api/v1/interview/sessions/${sessionId}/answer`, {
+      method: "POST",
+      token,
+      body: JSON.stringify(payload),
+    }),
+  getInterviewSessionSummary: (token: string | null, sessionId: string) =>
+    request<InterviewSessionSummaryResponse>(`/api/v1/interview/sessions/${sessionId}/summary`, {
+      token,
+    }),
+  finishInterviewSession: (token: string | null, sessionId: string) =>
+    request<InterviewSessionSummaryResponse>(`/api/v1/interview/sessions/${sessionId}/finish`, {
+      method: "POST",
+      token,
     }),
 };

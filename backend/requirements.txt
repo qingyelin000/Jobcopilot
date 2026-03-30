@@ -8,6 +8,7 @@ langgraph
 pydantic
 python-dotenv
 openai
+qdrant-client==1.17.1
 mcp
 requests
 sqlalchemy

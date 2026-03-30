@@ -157,3 +157,87 @@ export type ParsePdfResponse = {
   char_count: number;
   text: string;
 };
+
+export type InterviewQuestion = {
+  question_id: string;
+  source_content_id: string;
+  company: string;
+  role: string;
+  section?: string | null;
+  publish_time?: string | null;
+  question_text: string;
+  question_type: string;
+  ask_mode?: "new_question" | "follow_up" | string;
+  reason?: string;
+};
+
+export type InterviewEvaluation = {
+  scores: {
+    accuracy: number;
+    depth: number;
+    structure: number;
+    resume_fit: number;
+    overall: number;
+  };
+  strengths: string[];
+  improvements: string[];
+  feedback: string;
+  decision: "follow_up" | "next_question" | "finish" | string;
+  follow_up_hint: string;
+};
+
+export type InterviewSummary = {
+  overall_score: number;
+  dimension_scores: {
+    accuracy: number;
+    depth: number;
+    structure: number;
+    resume_fit: number;
+  };
+  strengths: string[];
+  improvements: string[];
+  summary: string;
+};
+
+export type InterviewSessionStartRequest = {
+  resume_id: number;
+  jd_id: number;
+  backend?: "v1" | "v2";
+  strict_metadata_filter?: boolean;
+};
+
+export type InterviewSessionStartResponse = {
+  session_id: string;
+  status: string;
+  backend: string;
+  current_round: number;
+  max_rounds: number;
+  question: InterviewQuestion;
+};
+
+export type InterviewAnswerResponse = {
+  session_id: string;
+  status: string;
+  current_round: number;
+  max_rounds: number;
+  evaluation: InterviewEvaluation | { message: string };
+  next_question?: InterviewQuestion | null;
+  summary?: InterviewSummary | null;
+};
+
+export type InterviewTurn = {
+  turn_index: number;
+  question: InterviewQuestion;
+  answer_text: string;
+  evaluation?: InterviewEvaluation | null;
+  created_at?: string | null;
+};
+
+export type InterviewSessionSummaryResponse = {
+  session_id: string;
+  status: string;
+  current_round: number;
+  max_rounds: number;
+  summary: InterviewSummary;
+  turns: InterviewTurn[];
+};

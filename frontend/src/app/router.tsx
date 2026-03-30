@@ -1,5 +1,6 @@
 import { Navigate, createBrowserRouter } from "react-router-dom";
 import { LoginPage } from "../features/auth/LoginPage";
+import { InterviewPage } from "../features/interview/InterviewPage";
 import { JobsPage } from "../features/jobs/JobsPage";
 import { ProfilePage } from "../features/profile/ProfilePage";
 import { ResumePage } from "../features/resume/ResumePage";
@@ -45,6 +46,13 @@ if (featureFlags.jobs) {
   appChildren.push({
     path: "jobs",
     element: <JobsPage />,
+  });
+}
+
+if (featureFlags.interview) {
+  appChildren.push({
+    path: "interview",
+    element: <InterviewPage />,
   });
 }
 

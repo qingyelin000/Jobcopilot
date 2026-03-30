@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import json
@@ -30,11 +30,15 @@ DEFAULT_HEADERS = {
 }
 
 DEFAULT_QUERIES = [
-    "Java 面经",
-    "后端 面经",
-    "算法 面经",
+    "Java \u9762\u7ecf",
+    "\u540e\u7aef \u9762\u7ecf",
+    "\u7b97\u6cd5 \u9762\u7ecf",
+    "AI\u5e94\u7528\u5f00\u53d1 \u9762\u7ecf",
+    "\u5927\u6a21\u578b\u7b97\u6cd5 \u9762\u7ecf",
+    "\u5927\u6a21\u578b\u5f00\u53d1 \u9762\u7ecf",
+    "\u6d4b\u8bd5\u5f00\u53d1 \u9762\u7ecf",
+    "\u524d\u7aef \u9762\u7ecf",
 ]
-
 
 class NowcoderCrawlerError(RuntimeError):
     pass

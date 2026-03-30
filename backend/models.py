@@ -93,3 +93,41 @@ class JDDocument(Base):
         onupdate=func.now(),
         nullable=False,
     )
+
+
+class InterviewSession(Base):
+    __tablename__ = "interview_sessions"
+
+    session_id = Column(String(32), primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    status = Column(String(16), nullable=False, index=True, default="asking")
+    backend = Column(String(8), nullable=False, default="v2")
+    top_k = Column(Integer, nullable=False, default=8)
+    max_rounds = Column(Integer, nullable=False, default=5)
+    current_round = Column(Integer, nullable=False, default=1)
+    query = Column(Text, nullable=True)
+    resume_text = Column(Text, nullable=False)
+    jd_text = Column(Text, nullable=False)
+    target_company = Column(String(120), nullable=True)
+    target_role = Column(String(120), nullable=True)
+    current_question_json = Column(JSON, nullable=True)
+    summary_json = Column(JSON, nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(
+        DateTime,
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+
+class InterviewTurn(Base):
+    __tablename__ = "interview_turns"
+
+    id = Column(Integer, primary_key=True, index=True)
+    session_id = Column(String(32), ForeignKey("interview_sessions.session_id"), nullable=False, index=True)
+    turn_index = Column(Integer, nullable=False, index=True)
+    question_json = Column(JSON, nullable=False)
+    answer_text = Column(Text, nullable=True)
+    evaluation_json = Column(JSON, nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)

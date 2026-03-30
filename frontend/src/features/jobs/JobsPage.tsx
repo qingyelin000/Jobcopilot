@@ -11,7 +11,7 @@ type Message = {
 };
 
 const starterPrompts = [
-  "帮我找上海的 Python 后端岗位",
+  "帮我找附近的 Python 后端岗位",
   "我想找偏 AI 应用工程师的职位",
   "给我几条适合社招后端工程师的检索建议",
 ];

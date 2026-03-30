@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Iterable
 
 
-DEFAULT_DATASET_PATH = Path("data/nowcoder/clean/long_content_retrieval_questions.jsonl")
+DEFAULT_DATASET_PATH = Path("data/nowcoder/pipeline_runs_llm/canonical/long_content_retrieval_questions.jsonl")
 
 TECH_KEYWORDS = {
     "java": "Java",
@@ -146,6 +146,8 @@ class RetrievalQuestion:
     company: str | None
     role: str | None
     section: str | None
+    publish_time: str | None
+    normalized_key: str | None
     question_text: str
     question_type: str
 
@@ -266,6 +268,8 @@ class RetrieverV1:
                     company=payload.get("company"),
                     role=payload.get("role"),
                     section=payload.get("section"),
+                    publish_time=payload.get("publish_time"),
+                    normalized_key=payload.get("normalized_key"),
                     question_text=str(payload["question_text"]),
                     question_type=str(payload["question_type"]),
                 )
@@ -439,6 +443,7 @@ def serialize_retrieved_question(item: RetrievedQuestion) -> dict[str, object]:
         "company": item.question.company,
         "role": item.question.role,
         "section": item.question.section,
+        "publish_time": item.question.publish_time,
         "question_text": item.question.question_text,
         "question_type": item.question.question_type,
         "score": item.score,

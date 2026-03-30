@@ -8,4 +8,5 @@ const enabledValue = (value: string | undefined, fallback: boolean) => {
 
 export const featureFlags = {
   jobs: enabledValue(import.meta.env.VITE_ENABLE_JOBS, true),
+  interview: enabledValue(import.meta.env.VITE_ENABLE_INTERVIEW, true),
 };
