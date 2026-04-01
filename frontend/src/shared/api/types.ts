@@ -139,16 +139,10 @@ export type ProcessHistoryItem = {
 
 export type ChatResponse = {
   reply: string;
-  need_location_consent?: boolean;
 };
 
 export type ChatRequest = {
   message: string;
-  location_consent?: boolean;
-  consent_scope?: "once" | "always";
-  user_city?: string;
-  latitude?: number;
-  longitude?: number;
 };
 
 export type ParsePdfResponse = {
@@ -202,7 +196,7 @@ export type InterviewSummary = {
 export type InterviewSessionStartRequest = {
   resume_id: number;
   jd_id: number;
-  backend?: "v1" | "v2";
+  backend?: "v2";
   strict_metadata_filter?: boolean;
 };
 

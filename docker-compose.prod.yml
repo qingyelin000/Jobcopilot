@@ -29,6 +29,8 @@ services:
   backend:
     build:
       context: ./backend
+      args:
+        PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.10-slim}
     container_name: jobcopilot_backend
     restart: unless-stopped
     volumes:
@@ -52,10 +54,16 @@ services:
       QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
       QDRANT_API_KEY: ${QDRANT_API_KEY:-}
       QDRANT_COLLECTION: ${QDRANT_COLLECTION:-nowcoder_interview_questions_v1}
-      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-hash}
-      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-}
-      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-}
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-openai_compatible}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-BAAI/bge-m3}
+      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-https://api.siliconflow.cn/v1}
       EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+      RERANK_ENABLED: ${RERANK_ENABLED:-true}
+      RERANK_MODEL: ${RERANK_MODEL:-BAAI/bge-reranker-v2-m3}
+      RERANK_BASE_URL: ${RERANK_BASE_URL:-https://api.siliconflow.cn/v1}
+      RERANK_API_KEY: ${RERANK_API_KEY:-}
+      RERANK_TIMEOUT_SECONDS: ${RERANK_TIMEOUT_SECONDS:-15}
+      RERANK_CANDIDATE_POOL: ${RERANK_CANDIDATE_POOL:-40}
     depends_on:
       mysql:
         condition: service_healthy
@@ -66,6 +74,8 @@ services:
     build:
       context: ./frontend
       args:
+        NODE_IMAGE: ${NODE_IMAGE:-node:22-alpine}
+        NGINX_IMAGE: ${NGINX_IMAGE:-nginx:1.27-alpine}
         VITE_ENABLE_JOBS: ${VITE_ENABLE_JOBS:-false}
         NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmjs.org/}
         NPM_REGISTRY_FALLBACK: ${NPM_REGISTRY_FALLBACK:-https://registry.npmmirror.com/}

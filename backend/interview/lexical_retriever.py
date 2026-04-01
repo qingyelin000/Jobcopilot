@@ -213,6 +213,7 @@ def _infer_preferred_types(text: str, keywords: list[str]) -> list[str]:
 
 
 def build_query_profile(resume_text: str, jd_text: str, extra_query: str | None = None) -> QueryProfile:
+    # 将查询上下文统一成 profile，供词法召回阶段复用。
     combined = "\n".join(part for part in (extra_query or "", jd_text, resume_text) if part).strip()
     keywords = _extract_curated_keywords(combined)
     return QueryProfile(
@@ -224,6 +225,7 @@ def build_query_profile(resume_text: str, jd_text: str, extra_query: str | None 
 
 
 def _mixed_tokenize(text: str) -> list[str]:
+    # 中英文混合切词：英文词 + 中文片段 + 中文 n-gram，提高召回鲁棒性。
     lowered = text.lower()
     tokens: list[str] = []
     for word in ASCII_WORD_PATTERN.findall(lowered):
@@ -240,12 +242,12 @@ def _mixed_tokenize(text: str) -> list[str]:
     return tokens
 
 
-class RetrieverV1:
+class LexicalRetriever:
     """
-    Minimal lexical retriever for mock interview v1.
+    Lightweight lexical retriever used as the sparse branch in RetrieverV2.
 
-    This version intentionally avoids extra runtime dependencies so we can
-    validate retrieval quality before switching the backend to embeddings.
+    It keeps the original v1 lexical behavior (tokenization, BM25 and
+    metadata/type boosts) without introducing extra runtime dependencies.
     """
 
     def __init__(self, dataset_path: Path | str = DEFAULT_DATASET_PATH) -> None:
@@ -296,6 +298,7 @@ class RetrieverV1:
     def _bm25_score(self, query_tokens: list[str], doc_tokens: list[str]) -> float:
         if not doc_tokens or not query_tokens:
             return 0.0
+        # BM25 是词法匹配主干分，后续会再叠加业务 boost。
         k1 = 1.5
         b = 0.75
         frequencies: dict[str, int] = {}
@@ -325,6 +328,7 @@ class RetrieverV1:
         top_k: int,
         preferred_types: list[str],
     ) -> list[RetrievedQuestion]:
+        # 多样性策略：优先覆盖偏好题型，同时限制同 section 过度集中。
         if len(results) <= top_k:
             return results
 
@@ -373,6 +377,7 @@ class RetrieverV1:
     ) -> list[RetrievedQuestion]:
         query_profile = build_query_profile(resume_text=resume_text, jd_text=jd_text, extra_query=extra_query)
         query_tokens: list[str] = []
+        # 构造查询词：关键词、岗位词、题型锚点和额外查询共同参与检索。
         for keyword in query_profile.keywords:
             query_tokens.extend(_mixed_tokenize(keyword))
         for role in query_profile.roles:
@@ -409,6 +414,7 @@ class RetrieverV1:
             if question.company and question.company in query_profile.raw_query:
                 company_score = 1.2
 
+            # 词法总分 = BM25 + 关键词/岗位/题型/公司加权信号。
             total_score = bm25_score + keyword_score + role_score + type_score + company_score
             if total_score <= 0:
                 continue

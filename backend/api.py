@@ -1,5 +1,4 @@
 import asyncio
-from contextlib import AsyncExitStack
 from datetime import datetime
 import hashlib
 from io import BytesIO
@@ -12,17 +11,12 @@ from pydantic import BaseModel, Field
 import agents
 import os
 import json
-import requests
 from document_assets import mark_interrupted_document_jobs, router as document_router
 from sqlalchemy import inspect, text
 from sqlalchemy.orm import Session
 from PyPDF2 import PdfReader
 
 from langchain_openai import ChatOpenAI
-# MCP 核心连接组件
-from mcp import ClientSession
-from mcp.client.sse import sse_client
-from intent_agent import llm_build_intent_plan, llm_evaluate_completion
 from auth import create_access_token, decode_access_token, get_password_hash, verify_password
 from auth_schemas import (
     LoginRequest,
@@ -36,7 +30,7 @@ from auth_schemas import (
 )
 from db import Base, SessionLocal, engine, get_db
 from interview.embedding_utils import default_embedding_provider_name
-from interview.retriever_v1 import DEFAULT_DATASET_PATH, RetrieverV1, serialize_retrieved_question
+from interview.retriever_v2 import DEFAULT_DATASET_PATH, serialize_retrieved_question
 from models import (
     JDDocument,
     InterviewSession,
@@ -152,11 +146,6 @@ class ParsePdfResponse(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str
-    location_consent: bool | None = None
-    consent_scope: str | None = None
-    user_city: str | None = None
-    latitude: float | None = None
-    longitude: float | None = None
 
 
 class InterviewSessionStartRequest(BaseModel):
@@ -237,15 +226,30 @@ def _safe_int_from_env(name: str, default: int, minimum: int | None = None) -> i
     return value
 
 
+def _safe_float_from_env(name: str, default: float, minimum: float | None = None) -> float:
+    raw_value = os.getenv(name)
+    if raw_value is None or not str(raw_value).strip():
+        value = float(default)
+    else:
+        try:
+            value = float(str(raw_value).strip())
+        except ValueError:
+            value = float(default)
+    if minimum is not None:
+        value = max(value, float(minimum))
+    return value
+
+
 INTERVIEW_TOP_K = min(_safe_int_from_env("INTERVIEW_TOP_K", 20, minimum=1), 20)
 INTERVIEW_MAX_ROUNDS = _safe_int_from_env("INTERVIEW_MAX_ROUNDS", 0, minimum=0)
 
 
 def _normalize_retriever_backend(value: str | None) -> str:
     backend = (value or DEFAULT_RETRIEVER_BACKEND or "v2").strip().lower()
-    if backend not in {"v1", "v2"}:
-        raise ValueError("Invalid backend. Use one of: v1, v2.")
-    return backend
+    if backend in {"", "v2", "v1"}:
+        # v1 has been sunset; keep compatibility by routing to v2.
+        return "v2"
+    raise ValueError("Invalid backend. Use: v2.")
 
 
 def _load_ready_resume_document(
@@ -322,15 +326,7 @@ def _compose_interview_query(
     return " ".join(query_parts)
 
 
-def _build_retriever_v1() -> RetrieverV1:
-    dataset_path = (
-        os.getenv("RETRIEVER_DATASET_PATH", str(DEFAULT_DATASET_PATH)).strip()
-        or str(DEFAULT_DATASET_PATH)
-    )
-    return RetrieverV1(dataset_path=dataset_path)
-
-
-def _build_retriever_v2() -> Any:
+def _build_retriever() -> Any:
     from interview.retriever_v2 import DEFAULT_QDRANT_COLLECTION, DEFAULT_QDRANT_URL, RetrieverV2
 
     dataset_path = (
@@ -358,6 +354,12 @@ def _build_retriever_v2() -> Any:
         vector_candidate_pool=_safe_int_from_env("RETRIEVER_V2_VECTOR_POOL", 64, minimum=8),
         lexical_candidate_pool=_safe_int_from_env("RETRIEVER_V2_LEXICAL_POOL", 40, minimum=8),
         strict_metadata_filter=_feature_enabled("RETRIEVER_V2_STRICT_METADATA_FILTER", default=False),
+        rerank_enabled=_feature_enabled("RERANK_ENABLED", default=True),
+        rerank_model=os.getenv("RERANK_MODEL", "").strip() or None,
+        rerank_api_key=os.getenv("RERANK_API_KEY", "").strip() or None,
+        rerank_base_url=os.getenv("RERANK_BASE_URL", "").strip() or None,
+        rerank_timeout_seconds=_safe_float_from_env("RERANK_TIMEOUT_SECONDS", 15.0, minimum=1.0),
+        rerank_candidate_pool=_safe_int_from_env("RERANK_CANDIDATE_POOL", 40, minimum=8),
     )
 
 
@@ -366,7 +368,7 @@ def _get_retriever(backend: str) -> Any:
         cached = _RETRIEVER_CACHE.get(backend)
         if cached is not None:
             return cached
-        retriever = _build_retriever_v2() if backend == "v2" else _build_retriever_v1()
+        retriever = _build_retriever()
         _RETRIEVER_CACHE[backend] = retriever
         return retriever
 
@@ -602,72 +604,6 @@ def _finalize_interview_session(
     return summary
 
 
-def _normalize_city(city: str | None) -> str:
-    if not city:
-        return ""
-    return str(city).strip().replace("市", "")
-
-
-def _reverse_geocode_by_amap(latitude: float, longitude: float) -> str:
-    key = os.getenv("GEO_AMAP_KEY", "").strip()
-    if not key:
-        return ""
-    try:
-        response = requests.get(
-            "https://restapi.amap.com/v3/geocode/regeo",
-            params={
-                "key": key,
-                "location": f"{longitude},{latitude}",
-                "extensions": "base",
-            },
-            timeout=5,
-        )
-        data = response.json()
-        if data.get("status") != "1":
-            return ""
-        address = data.get("regeocode", {}).get("addressComponent", {})
-        city = _normalize_city(address.get("city"))
-        if city:
-            return city
-        return _normalize_city(address.get("province"))
-    except Exception:
-        return ""
-
-
-def _reverse_geocode_by_tencent(latitude: float, longitude: float) -> str:
-    key = os.getenv("GEO_TENCENT_KEY", "").strip()
-    if not key:
-        return ""
-    try:
-        response = requests.get(
-            "https://apis.map.qq.com/ws/geocoder/v1/",
-            params={
-                "key": key,
-                "location": f"{latitude},{longitude}",
-            },
-            timeout=5,
-        )
-        data = response.json()
-        if data.get("status") != 0:
-            return ""
-        address = data.get("result", {}).get("address_component", {})
-        city = _normalize_city(address.get("city"))
-        if city:
-            return city
-        return _normalize_city(address.get("province"))
-    except Exception:
-        return ""
-
-
-def _resolve_city_from_coordinates(latitude: float | None, longitude: float | None) -> str:
-    if latitude is None or longitude is None:
-        return ""
-    city = _reverse_geocode_by_amap(latitude, longitude)
-    if city:
-        return city
-    return _reverse_geocode_by_tencent(latitude, longitude)
-
-
 def _extract_bearer_token(authorization: str | None) -> str | None:
     if not authorization:
         return None
@@ -698,24 +634,6 @@ def get_current_user(
     if not current_user:
         raise HTTPException(status_code=401, detail="未登录或登录已过期")
     return current_user
-
-def _mcp_result_to_text(result) -> str:
-    content = getattr(result, "content", None)
-    if isinstance(content, list):
-        texts = []
-        for item in content:
-            text = getattr(item, "text", None)
-            if text:
-                texts.append(text)
-        if texts:
-            return "\n".join(texts)
-    return str(result)
-
-
-async def call_mcp_tool(session: ClientSession, tool_name: str, arguments: dict) -> str:
-    result = await session.call_tool(tool_name, arguments=arguments)
-    return _mcp_result_to_text(result)
-
 
 def _extract_text_from_pdf_bytes(file_bytes: bytes) -> tuple[str, int]:
     reader = PdfReader(BytesIO(file_bytes))
@@ -1351,23 +1269,15 @@ async def retrieve_interview_questions(req: InterviewRetrieveRequest):
     top_k = max(1, min(int(req.top_k), 20))
     try:
         retriever = _get_retriever(backend)
-        if backend == "v2":
-            results = retriever.search(
-                resume_text=req.resume_text,
-                jd_text=req.jd_text,
-                top_k=top_k,
-                extra_query=req.query or None,
-                target_company=(req.target_company or "").strip() or None,
-                target_role=(req.target_role or "").strip() or None,
-                strict_metadata_filter=req.strict_metadata_filter,
-            )
-        else:
-            results = retriever.search(
-                resume_text=req.resume_text,
-                jd_text=req.jd_text,
-                top_k=top_k,
-                extra_query=req.query or None,
-            )
+        results = retriever.search(
+            resume_text=req.resume_text,
+            jd_text=req.jd_text,
+            top_k=top_k,
+            extra_query=req.query or None,
+            target_company=(req.target_company or "").strip() or None,
+            target_role=(req.target_role or "").strip() or None,
+            strict_metadata_filter=req.strict_metadata_filter,
+        )
     except FileNotFoundError as exc:
         raise HTTPException(status_code=500, detail=f"Retriever dataset not found: {exc}") from exc
     except Exception as exc:
@@ -1420,23 +1330,15 @@ async def start_interview_session(
 
     try:
         retriever = _get_retriever(backend)
-        if backend == "v2":
-            results = retriever.search(
-                resume_text=resume_text,
-                jd_text=jd_text,
-                top_k=top_k,
-                extra_query=query_text or None,
-                target_company=target_company or None,
-                target_role=target_role or None,
-                strict_metadata_filter=req.strict_metadata_filter,
-            )
-        else:
-            results = retriever.search(
-                resume_text=resume_text,
-                jd_text=jd_text,
-                top_k=top_k,
-                extra_query=query_text or None,
-            )
+        results = retriever.search(
+            resume_text=resume_text,
+            jd_text=jd_text,
+            top_k=top_k,
+            extra_query=query_text or None,
+            target_company=target_company or None,
+            target_role=target_role or None,
+            strict_metadata_filter=req.strict_metadata_filter,
+        )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Interview retriever failed: {exc}") from exc
 
@@ -1608,23 +1510,15 @@ async def answer_interview_session(
     candidate_questions: list[dict[str, Any]] = []
     try:
         retriever = _get_retriever(str(session.backend or "v2"))
-        if str(session.backend or "v2") == "v2":
-            next_results = retriever.search(
-                resume_text=str(session.resume_text or ""),
-                jd_text=str(session.jd_text or ""),
-                top_k=int(session.top_k or 8),
-                extra_query=str(session.query or "") or None,
-                target_company=str(session.target_company or "") or None,
-                target_role=str(session.target_role or "") or None,
-                strict_metadata_filter=False,
-            )
-        else:
-            next_results = retriever.search(
-                resume_text=str(session.resume_text or ""),
-                jd_text=str(session.jd_text or ""),
-                top_k=int(session.top_k or 8),
-                extra_query=str(session.query or "") or None,
-            )
+        next_results = retriever.search(
+            resume_text=str(session.resume_text or ""),
+            jd_text=str(session.jd_text or ""),
+            top_k=int(session.top_k or 8),
+            extra_query=str(session.query or "") or None,
+            target_company=str(session.target_company or "") or None,
+            target_role=str(session.target_role or "") or None,
+            strict_metadata_filter=False,
+        )
         candidate_questions = [serialize_retrieved_question(item) for item in next_results]
     except Exception:
         candidate_questions = []
@@ -1866,128 +1760,26 @@ async def delete_process_job(
 
 
 @app.post("/api/v1/chat")
-async def chat_with_agent(
-    req: ChatRequest,
-    current_user: User | None = Depends(get_current_user_optional),
-    db: Session = Depends(get_db),
-):
+async def chat_with_agent(req: ChatRequest):
     if not _feature_enabled("ENABLE_CHAT", True):
-        raise HTTPException(status_code=404, detail="聊天功能暂未开放")
+        raise HTTPException(status_code=404, detail="Chat feature is disabled")
 
-    # 意图驱动聊天接口：先判意图，再决定调用哪些工具与顺序
     try:
-        # 获取环境变量中 MCP 爬虫服务器的地址
-        mcp_url = os.environ.get("MCP_SERVER_URL", "http://mcp_server:8001/sse")
-        
-        async with AsyncExitStack() as stack:
-            # 1. 建立与爬虫微服务节点的 SSE 远程连接！
-            sse_transport = await stack.enter_async_context(sse_client(mcp_url))
-            session = await stack.enter_async_context(ClientSession(sse_transport[0], sse_transport[1]))
-            await session.initialize()
-            
-            # 2. 动态发现远程能用的绝技 (Tools)
-            mcp_response = await session.list_tools()
-            available_tools = {tool.name for tool in mcp_response.tools}
-            
-            # 3. 初始化绑定了 DeepSeek 的大模型
-            llm = ChatOpenAI(
-                api_key=os.environ.get('DEEPSEEK_API_KEY'),
-                base_url=os.environ.get('OPENAI_BASE_URL', 'https://api.deepseek.com'),
-                model='deepseek-chat',
-                temperature=0.2,
-            )
-
-            # 4. 意图Agent(LLM)先判断：调用什么工具、如何执行、执行顺序
-            intent_plan = await llm_build_intent_plan(req.message, sorted(list(available_tools)), llm)
-
-            execution_steps = [step for step in intent_plan.execution_steps if step.tool_name in available_tools]
-            tool_outputs = []
-            city_name = _normalize_city(req.user_city)
-            if not city_name:
-                city_name = _resolve_city_from_coordinates(req.latitude, req.longitude)
-
-            scope = (req.consent_scope or "").strip().lower()
-            should_persist_consent = scope == "always"
-            effective_location_consent = (
-                req.location_consent
-                if req.location_consent is not None
-                else (current_user.location_consent if current_user else False)
-            )
-
-            if req.location_consent is not None and current_user and should_persist_consent:
-                current_user.location_consent = req.location_consent
-                db.add(current_user)
-                db.commit()
-                db.refresh(current_user)
-
-            # 5. 按计划执行工具，并在每步后评估是否完成
-            max_steps = min(len(execution_steps), 5)
-            for index in range(max_steps):
-                step = execution_steps[index]
-                if step.tool_name == 'get_user_location':
-                    location_text = await call_mcp_tool(
-                        session,
-                        'get_user_location',
-                        {
-                            'consent': effective_location_consent,
-                            'user_city': req.user_city or '',
-                        },
-                    )
-                    tool_outputs.append({'tool': 'get_user_location', 'output': location_text})
-
-                    if '未获得用户定位授权' in location_text:
-                        return {'reply': location_text, 'need_location_consent': True}
-
-                    if not city_name:
-                        city_name = location_text.strip().replace('市', '')
-
-                elif step.tool_name == 'crawl_nearby_jobs':
-                    if not city_name:
-                        return {'reply': '要帮你找附近工作，我需要你的城市信息或定位授权。'}
-
-                    step_args = dict(step.arguments or {})
-                    step_args.setdefault('keyword', 'Python')
-                    step_args.setdefault('num_pages', 1)
-                    step_args['city_name'] = city_name
-
-                    crawler_text = await call_mcp_tool(
-                        session,
-                        'crawl_nearby_jobs',
-                        step_args,
-                    )
-                    tool_outputs.append({'tool': 'crawl_nearby_jobs', 'output': crawler_text})
-
-                else:
-                    generic_text = await call_mcp_tool(
-                        session,
-                        step.tool_name,
-                        dict(step.arguments or {}),
-                    )
-                    tool_outputs.append({'tool': step.tool_name, 'output': generic_text})
-
-                evaluation = await llm_evaluate_completion(req.message, intent_plan, tool_outputs, llm)
-                if evaluation.is_complete or not evaluation.should_continue:
-                    break
-
-            # 6. 组织最终回复
-            if tool_outputs:
-                final_prompt = (
-                    '你是 JobCopilot 求职助手。请根据用户问题、意图计划和工具结果给出简洁、结构化回答。\n'
-                    f'用户问题: {req.message}\n'
-                    f'意图计划: {intent_plan.model_dump_json(ensure_ascii=False)}\n'
-                    f'工具输出: {json.dumps(tool_outputs, ensure_ascii=False)}\n'
-                    '请输出中文结果，若工具失败需给出下一步建议。'
-                )
-                final_msg = await llm.ainvoke(final_prompt)
-                return {'reply': final_msg.content}
-
-            # 无需工具时直接聊天回答
-            normal_msg = await llm.ainvoke(
-                f"你是 JobCopilot 求职助手，请直接回答用户问题：{req.message}"
-            )
-            return {'reply': normal_msg.content}
-
-    except Exception as e:
+        llm = ChatOpenAI(
+            api_key=os.environ.get("DEEPSEEK_API_KEY"),
+            base_url=os.environ.get("OPENAI_BASE_URL", "https://api.deepseek.com"),
+            model="deepseek-chat",
+            temperature=0.2,
+        )
+        prompt = (
+            "You are JobCopilot, a practical career assistant. "
+            "Give concise, actionable, and honest guidance in Chinese.\n"
+            f"User message: {req.message}"
+        )
+        reply = await llm.ainvoke(prompt)
+        return {"reply": (reply.content or "").strip()}
+    except Exception as exc:
         import traceback
+
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(exc))

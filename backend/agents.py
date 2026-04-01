@@ -214,7 +214,7 @@ def _repair_mimo_json_output(
     )
     repair_user_prompt = (
         f"JSON Schema:\n{json.dumps(response_schema, ensure_ascii=False)}\n\n"
-        f"寰呬慨澶嶆枃鏈?\n{broken_output}"
+        f"待修复文本:\n{broken_output}"
     )
 
     response = _mimo_chat_completion(
@@ -243,7 +243,7 @@ def call_deepseek_structured(
     resolved_model = _resolve_model_alias(model) or _default_chat_model()
     strict_system_prompt = (
         f"{system_prompt}\n\n"
-        "鍙繑鍥炰竴涓悎娉?JSON 瀵硅薄锛屼笉瑕佽緭鍑?markdown 浠ｇ爜鍧楁垨棰濆瑙ｉ噴銆俓n"
+        "只返回一个合法 JSON 对象，不要输出 markdown 代码块或额外解释。\n"
         f"JSON Schema:\n{json.dumps(response_schema, ensure_ascii=False)}"
     )
 
@@ -280,7 +280,7 @@ def call_mimo_structured(
     resolved_model = _resolve_model_alias(model) or _default_mimo_model()
     strict_system_prompt = (
         f"{system_prompt}\n\n"
-        "鍙繑鍥炰竴涓悎娉?JSON 瀵硅薄锛屼笉瑕佽緭鍑?markdown 浠ｇ爜鍧楁垨棰濆瑙ｉ噴銆俓n"
+        "只返回一个合法 JSON 对象，不要输出 markdown 代码块或额外解释。\n"
         f"JSON Schema:\n{json.dumps(response_schema, ensure_ascii=False)}"
     )
 
@@ -320,10 +320,16 @@ def call_mimo_structured(
 
 def parse_resume_to_json(resume_text: str, model: str | None = None) -> UserInfo:
     system_prompt = """
-浣犳槸绠€鍘嗙粨鏋勫寲淇℃伅鎻愬彇鍔╂墜銆?璇蜂粠鍘熷涓枃绠€鍘嗘枃鏈腑鎻愬彇缁撴瀯鍖栨暟鎹€?
-瑙勫垯锛?1. 鍙繚鐣欒緭鍏ユ枃鏈腑鏈夎瘉鎹殑淇℃伅銆?2. 涓嶈鏉滄挵椤圭洰鍚嶇О銆佹寚鏍囥€佹妧鏈爤鎴栬亴璐ｃ€?3. 鎶€鑳介」灏介噺鏍囧噯鍖栥€佺畝娲佽〃杈俱€?4. 缂哄け瀛楁鎸?schema 榛樿鍊艰繑鍥烇紙绌哄瓧绗︿覆鎴栫┖鏁扮粍锛夈€?5. `projects` 浼樺厛鎻愬彇鏈夊疄璐ㄥ唴瀹圭殑椤圭洰缁忓巻銆?"""
+你是简历结构化信息提取助手。请从原始中文简历文本中提取结构化数据。
+规则：
+1. 只保留输入文本中有证据的信息。
+2. 不要杜撰项目名称、指标、技术栈或职责。
+3. 技能项尽量标准化、简洁表达。
+4. 缺失字段按 schema 默认值返回（空字符串或空数组）。
+5. `projects` 优先提取有实质内容的项目经历。
+"""
 
-    user_prompt = f"鍘熷绠€鍘嗘枃鏈細\n{resume_text}"
+    user_prompt = f"原始简历文本：\n{resume_text}"
     raw_data = call_deepseek_structured(
         system_prompt,
         user_prompt,
@@ -335,10 +341,16 @@ def parse_resume_to_json(resume_text: str, model: str | None = None) -> UserInfo
 
 def parse_jd_to_json(jd_text: str, model: str | None = None) -> JDInfo:
     system_prompt = """
-浣犳槸宀椾綅 JD 缁撴瀯鍖栦俊鎭彁鍙栧姪鎵嬨€?璇蜂粠鍘熷涓枃 JD 鏂囨湰涓彁鍙栨嫑鑱樿姹傘€?
-瑙勫垯锛?1. `must_have_skills` 浠呮斁纭€ц姹傛妧鑳姐€?2. 鍔犲垎椤规斁鍏?`nice_to_have_skills`銆?3. `core_responsibilities` 鐢ㄥ姩浣滃鍚戠煭璇€荤粨銆?4. 涓嶈琛ュ厖 JD 涓湭鍑虹幇鐨勪俊鎭€?5. 缂哄け瀛楁鎸?schema 榛樿鍊艰繑鍥炪€?"""
+你是岗位 JD 结构化信息提取助手。请从原始中文 JD 文本中提取招聘要求。
+规则：
+1. `must_have_skills` 只放硬性要求技能。
+2. 加分项放入 `nice_to_have_skills`。
+3. `core_responsibilities` 使用动作导向短语总结。
+4. 不要补充 JD 中未出现的信息。
+5. 缺失字段按 schema 默认值返回。
+"""
 
-    user_prompt = f"鍘熷 JD 鏂囨湰锛歕n{jd_text}"
+    user_prompt = f"原始 JD 文本：\n{jd_text}"
     raw_data = call_deepseek_structured(
         system_prompt,
         user_prompt,
@@ -385,7 +397,7 @@ def _extract_label_value(text: str, labels: list[str], *, max_len: int) -> str:
     if not labels:
         return ""
     escaped = [re.escape(item) for item in labels]
-    pattern = rf"(?:{'|'.join(escaped)})\s*[:锛歖\s*([^\n\r]{{1,{max_len}}})"
+    pattern = rf"(?:{'|'.join(escaped)})\s*[:：]\s*([^\n\r]{{1,{max_len}}})"
     match = re.search(pattern, str(text or ""), flags=re.IGNORECASE)
     if not match:
         return ""
@@ -396,7 +408,7 @@ def _guess_job_title_from_text(jd_text: str) -> str:
     text = str(jd_text or "")
     title_from_label = _extract_label_value(
         text,
-        ["宀椾綅", "宀椾綅鍚嶇О", "鑱屼綅", "鑱屼綅鍚嶇О", "鎷涜仒宀椾綅", "Job Title"],
+        ["岗位", "岗位名称", "职位", "职位名称", "招聘岗位", "Job Title"],
         max_len=DEFAULT_MAX_TITLE_LEN,
     )
     if title_from_label:
@@ -404,19 +416,19 @@ def _guess_job_title_from_text(jd_text: str) -> str:
 
     first_line = _first_non_empty_line(text)
     if first_line and len(first_line) <= 40 and re.search(
-        r"(宸ョ▼甯坾寮€鍙憒绠楁硶|浜у搧|缁忕悊|涓撳|瀹炰範|璁捐甯坾鏋舵瀯甯坾鍒嗘瀽甯?",
+        r"(工程师|开发|算法|产品|经理|专家|实习|设计师|架构师|分析师)",
         first_line,
     ):
         return first_line[:DEFAULT_MAX_TITLE_LEN]
 
-    bracket_match = re.search(r"[銆怽[]([^銆慭]\n]{2,40})[銆慭]]", text)
+    bracket_match = re.search(r"[【\[]([^】\]\n]{2,40})[】\]]", text)
     if bracket_match:
         bracket_value = bracket_match.group(1).strip()
-        if re.search(r"(宸ョ▼甯坾寮€鍙憒绠楁硶|浜у搧|缁忕悊|涓撳|瀹炰範|璁捐甯坾鏋舵瀯甯坾鍒嗘瀽甯?", bracket_value):
+        if re.search(r"(工程师|开发|算法|产品|经理|专家|实习|设计师|架构师|分析师)", bracket_value):
             return bracket_value[:DEFAULT_MAX_TITLE_LEN]
 
     generic_match = re.search(
-        r"([A-Za-z0-9+\-/路\u4e00-\u9fa5]{2,30}(?:宸ョ▼甯坾寮€鍙憒绠楁硶|浜у搧|缁忕悊|涓撳|瀹炰範鐢焲璁捐甯坾鏋舵瀯甯坾鍒嗘瀽甯?)",
+        r"([A-Za-z0-9+\-/·\u4e00-\u9fa5]{2,30}(?:工程师|开发|算法|产品|经理|专家|实习生|设计师|架构师|分析师))",
         text,
     )
     if generic_match:
@@ -513,13 +525,19 @@ def build_jd_interview_profile(jd_info: JDInfo) -> JDInterviewProfile:
 
 def map_resume_to_jd(user_info: UserInfo, jd_info: JDInfo, model: str | None = None) -> ResumeJDMapping:
     system_prompt = """
-浣犳槸璧勬繁鎶€鏈嫑鑱樹笓瀹跺拰绠€鍘嗙瓥鐣ラ【闂€備綘鐨勪换鍔℃槸娣卞害鍒嗘瀽鍊欓€変汉绠€鍘嗕笌鑱屼綅鎻忚堪锛圝D锛夌殑鍖归厤绋嬪害锛屽苟杈撳嚭涓ユ牸缁撴瀯鍖栫殑缁撴灉銆?
-璇烽伒寰互涓嬫牳蹇冨師鍒欒繘琛屽垎鏋愶細
-1. 璇佹嵁鏀拺涓轰富锛氭瘡涓尮閰嶇偣閮藉繀椤绘湁绠€鍘嗕腑鐨勫叿浣撲簨瀹炲拰椤圭洰璇佹嵁鏀拺锛岀攧鍒粎鍋滅暀鍦ㄢ€滃叧閿瘝缃楀垪鈥濆眰闈㈢殑鏃犳晥鍖归厤 銆?2. 璇嗗埆杩囧害鍖呰锛氳鎯曞皢绠€鍗曠殑鍩虹API璋冪敤杩囧害鍖呰涓哄鏉傜郴缁燂紙濡傚皢鍩虹瀵硅瘽鎷兼帴鍖呰鎴愨€淎gent鈥濓級鐨勮涓?銆傚鏋滃尮閰嶇偣缁忎笉璧锋繁搴﹁拷闂紝蹇呴』闄嶇骇璇勪及銆?3. 椋庨櫓鐐瑰瑙傝瘹瀹烇細鏄庣‘鎸囧嚭绠€鍘嗕腑缂轰箯鍖哄垎搴︼紙濡傛爣鍑嗙殑鏁欑▼椤圭洰鏃犻澶栨帰绱?锛夋垨缁忓巻鎻忚堪瀹芥硾锛堝鍙啓鈥滃弬涓?璐熻矗鈥濊€屾棤鍏蜂綋鍔ㄤ綔鍜岀粨鏋滐級鐨勯闄╋紝涓嶈杩囧害涔愯銆?4. 鑱氱劍鏍稿績鍖哄垎搴︼細璇嗗埆骞堕噸鐐硅瘎浼扮畝鍘嗕腑灞曠ず浜嗙嫭绔嬫€濊€冦€佸仛杩囨繁搴︽柟妗堝姣旀垨鎬ц兘浼樺寲鐨勯儴鍒嗐€?5. 浼樺寲鐒︾偣锛坮ewrite_focus锛夛細閽堝鍖归厤鐭澘锛屾彁渚涘叿浣撱€佸彲鎵ц鐨勫缓璁紝閬垮厤绌鸿瘽濂楄瘽銆?6. 杈撳嚭瑕佹眰锛氫繚鎸佸瑙傘€佷笓涓氾紝杈撳嚭瀹屾暣浣嗕繚鎸佺畝娲併€?"""
+你是资深技术招聘专家和简历策略顾问。你的任务是分析候选人简历与职位描述（JD）的匹配程度，并输出严格结构化结果。
+请遵循以下原则：
+1. 证据驱动：每个匹配点必须有简历中的事实支撑，避免只做关键词对齐。
+2. 识别过度包装：警惕把基础 API 调用包装为复杂系统（例如把普通调用描述成 Agent）。
+3. 客观指出风险：明确缺少区分度或描述空泛的内容，不要一味乐观。
+4. 关注差异化信号：优先识别独立思考、方案对比、性能优化等高价值内容。
+5. `rewrite_focus` 要可执行：给出具体改写建议，避免空话套话。
+6. 输出保持专业、简洁、可落地。
+"""
 
     user_prompt = (
-        f"缁撴瀯鍖栫畝鍘嗘暟鎹細\n{user_info.model_dump_json(indent=2, ensure_ascii=False)}\n\n"
-        f"缁撴瀯鍖?JD 鏁版嵁锛歕n{jd_info.model_dump_json(indent=2, ensure_ascii=False)}"
+        f"结构化简历数据：\n{user_info.model_dump_json(indent=2, ensure_ascii=False)}\n\n"
+        f"结构化 JD 数据：\n{jd_info.model_dump_json(indent=2, ensure_ascii=False)}"
     )
 
     selected_model = _resolve_stage_model("map", model)
@@ -541,14 +559,21 @@ def rewrite_resume_bullets(
     model: str | None = None,
 ) -> OptimizedResume:
     system_prompt = """
-浣犳槸璧勬繁鎶€鏈畝鍘嗕紭鍖栭【闂€備綘鐨勪换鍔℃槸甯姪鍊欓€変汉閲嶆瀯鍜屼紭鍖栫畝鍘嗭紝浣垮叾鍦ㄧ瓫閫夊拰闈㈣瘯涓叿澶囨瀬楂樼殑鍖哄垎搴︺€?
-璇蜂弗鏍奸伒寰互涓嬩紭鍖栬鍒欏鐞嗙敤鎴风殑绠€鍘嗭細
-1. 閲囩敤涓夋寮忕粨鏋勶紙鐮撮櫎鎶€鏈爤缃楀垪锛夛細椤圭洰鎻忚堪蹇呴』閲囩敤鈥滈棶棰?鈫?鏂规 鈫?閲忓寲缁撴灉鈥濈殑涓夋寮忕粨鏋勩€傚皢鎶€鏈爤鑷劧铻嶅叆鍏蜂綋鐨勫仛娉曟弿杩颁腑锛屼笉瑕佸崟鐙綏鍒楁鏃犳剰涔夌殑妗嗘灦鍚嶇О 銆?2. 寮哄寲鍔ㄤ綔涓庨噺鍖栫粨鏋滐紙鐮撮櫎宸ヤ綔鏃ュ織鍐欐硶锛夛細灏嗏€滃弬涓庘€濄€佲€滆礋璐ｂ€濄€佲€滃崗鍔┾€濈瓑妯＄硦璇嶆浛鎹负鈥滆璁♀€濄€佲€滃疄鐜扳€濄€佲€滃姣斺€濄€佲€滀紭鍖栤€濄€佲€滀慨澶嶁€濈瓑鍏蜂綋鍔ㄤ綔璇?銆傛墍鏈夌粨鏋滃繀椤绘湁鍏蜂綋鏁板瓧鏀拺锛堝鈥滃噯纭巼浠?62% 鎻愬崌鍒?81%鈥濓級锛屼弗绂佷娇鐢ㄢ€滄彁鍗囦簡鏁堟灉鈥濈瓑妯＄硦琛ㄨ堪 銆?3. 鎷掔粷杩囧害鍖呰锛堝疄浜嬫眰鏄樉娣卞害锛夛細浣犳槸浠€涔堟按骞冲氨鍐欎粈涔堟按骞筹紝浣嗚鎶婂仛鍒扮殑灞傛鍐欐繁銆傝嫢鍙槸鍩虹LLM搴旂敤锛岄噸鐐瑰啓Prompt宸ョ▼銆佸垏鍒嗙瓥鐣ユ垨涓婁笅鏂囨帶鍒?锛涜嫢鏄疉gent锛屽繀椤荤獊鍑哄叾鐗规湁鏈哄埗锛堝ReAct寰幆銆佸伐鍏疯皟鐢ㄥけ璐ユ仮澶嶃€侀槻姝㈡棤闄愬惊鐜璁★級銆?4. 鎸栨帢椤圭洰宸紓鍖栵紙鐮撮櫎鏁欑▼椤圭洰鍏呮暟锛夛細瀵逛簬鍩虹鐨勮绋嬫垨鏁欑▼椤圭洰锛屽繀椤诲睍绀衡€滃湪鏁欑▼涔嬪浣犺繕鍋氫簡浠€涔堚€?銆傞噸鐐硅ˉ鍏呮帹鐞嗛樁娈电殑鎬ц兘浼樺寲銆佽竟鐣岄棶棰橈紙濡傜煭鏂囨湰锛夌殑瑙ｅ喅杩囩▼鎴栧涓嶅悓鏂规鐨勬繁鍏ュ姣?銆?5. 鎶€鑳藉垪琛ㄢ€滃幓姘粹€濓細鍙繚鐣欏€欓€変汉鑳藉湪闈㈣瘯涓拺浣?5鍒嗛挓杩介棶鐨勬妧鏈€傛槑纭垎灞傛爣娉ㄧ啛缁冨害锛屸€滅啛鎮夆€濇剰鍛崇潃鑳界櫧鏉挎墜鍐欙紝鈥滀簡瑙ｂ€濇剰鍛崇潃鎳傚師鐞?銆傚潥鍐冲垹鍑忎负浜嗗厖鏁拌€屽爢鐮岀殑鍏抽敭璇?銆?6. 鐢ㄤ簨瀹炴浛浠ｅ舰瀹硅瘝锛堢牬闄ょ┖娲炶嚜鎴戣瘎浠凤級锛氱洿鎺ュ垹闄も€滃涔犺兘鍔涘己鈥濄€佲€滄矡閫氳兘鍔涘ソ鈥濈瓑闆朵俊鎭噺鐨勬€ф牸鎻忚堪 銆傚繀椤绘浛鎹负鍙獙璇佺殑浜嬪疄锛屽寮€婧愯础鐚紙PR锛夈€佹妧鏈崥瀹㈤槄璇婚噺銆佸鐜扮殑璁烘枃鏁伴噺鎴栫珵璧涙垚缁?銆?"""
+你是资深技术简历优化顾问。请在不捏造经历的前提下优化简历表达，使其更有区分度和可验证性。
+请严格遵循以下规则：
+1. 项目描述尽量采用“问题 -> 方案 -> 量化结果”结构。
+2. 用具体动作词（设计/实现/优化/排障）替代“参与/负责”等空泛描述。
+3. 结果尽量量化；无法量化时给出可验证事实。
+4. 禁止过度包装：基础功能不要夸大为复杂系统；涉及 Agent 必须写清机制与边界。
+5. 优先突出教程项目之外的增量工作（对比实验、性能优化、异常处理、工程化改造等）。
+6. 技能只保留可在面试中展开证明的内容，并体现熟练度。
+7. 删除空洞软性评价，改成事实证据（PR、博客、竞赛、复现等）。
+"""
 
     user_prompt = (
-        f"缁撴瀯鍖栫畝鍘嗘暟鎹細\n{user_info.model_dump_json(indent=2, ensure_ascii=False)}\n\n"
-        f"缁撴瀯鍖?JD 鏁版嵁锛歕n{jd_info.model_dump_json(indent=2, ensure_ascii=False)}\n\n"
-        f"绠€鍘?JD 鏄犲皠缁撴灉锛歕n{mapping.model_dump_json(indent=2, ensure_ascii=False)}"
+        f"结构化简历数据：\n{user_info.model_dump_json(indent=2, ensure_ascii=False)}\n\n"
+        f"结构化 JD 数据：\n{jd_info.model_dump_json(indent=2, ensure_ascii=False)}\n\n"
+        f"简历-JD 映射结果：\n{mapping.model_dump_json(indent=2, ensure_ascii=False)}"
     )
 
     selected_model = _resolve_stage_model("rewrite", model)
@@ -804,14 +829,20 @@ def review_mapping_quality(
     model: str | None = None,
 ) -> MappingQualityScore:
     system_prompt = """
-浣犳槸涓ユ牸鐨勨€滅畝鍘?JD 鏄犲皠璐ㄩ噺璇勫鍛樷€濄€?璇峰鏄犲皠缁撴灉鎵撳垎锛?-100锛夈€?
-璇勫垎缁村害锛?- coverage_score锛歮ust-have 瑕佹眰瑕嗙洊搴︺€?- evidence_score锛氳瘉鎹川閲忎笌鍏蜂綋绋嬪害銆?- gap_score锛氱己鍙?椋庨櫓璇嗗埆瀹屾暣鎬т笌鐪熷疄鎬с€?- actionable_score锛氬鍚庣画鏀瑰啓鐨勫彲鎵ц鎬с€?- overall_score锛氱患鍚堣瘎鍒嗐€?
-`strengths` 鍜?`issues` 瑕佺畝娲併€佸叿浣撱€?"""
+你是严格的“简历-JD 映射质量评审员”。请对映射结果打分（0-100）。
+评分维度：
+- coverage_score：must-have 要求覆盖度。
+- evidence_score：证据质量与具体程度。
+- gap_score：缺口/风险识别的完整性与真实性。
+- actionable_score：对后续改写的可执行性。
+- overall_score：综合评分。
+`strengths` 和 `issues` 必须简洁、具体、可验证。
+"""
 
     user_prompt = (
-        f"绠€鍘嗘暟鎹細\n{user_info.model_dump_json(indent=2, ensure_ascii=False)}\n\n"
-        f"JD 鏁版嵁锛歕n{jd_info.model_dump_json(indent=2, ensure_ascii=False)}\n\n"
-        f"鏄犲皠杈撳嚭锛歕n{mapping.model_dump_json(indent=2, ensure_ascii=False)}"
+        f"简历数据：\n{user_info.model_dump_json(indent=2, ensure_ascii=False)}\n\n"
+        f"JD 数据：\n{jd_info.model_dump_json(indent=2, ensure_ascii=False)}\n\n"
+        f"映射输出：\n{mapping.model_dump_json(indent=2, ensure_ascii=False)}"
     )
 
     raw_data = call_deepseek_structured(
@@ -832,15 +863,22 @@ def review_rewrite_quality(
     model: str | None = None,
 ) -> RewriteQualityScore:
     system_prompt = """
-浣犳槸涓ユ牸鐨勨€滅畝鍘嗘敼鍐欒川閲忚瘎瀹″憳鈥濄€?璇峰鏀瑰啓缁撴灉鎵撳垎锛?-100锛夈€?
-璇勫垎缁村害锛?- faithfulness_score锛氫笌鍘熷绠€鍘嗕簨瀹炰竴鑷存€с€?- jd_alignment_score锛氫笌 JD 瑕佹眰鍜岃亴璐ｇ殑瀵归綈绋嬪害銆?- impact_score锛氬姩浣?缁撴灉琛ㄨ揪涓庡彲閲忓寲绋嬪害銆?- readability_score锛氬彲璇绘€т笌绠€娲佸害銆?- ats_score锛氬叧閿瘝瑕嗙洊涓?ATS 鍙嬪ソ搴︺€?- overall_score锛氱患鍚堣瘎鍒嗐€?
-`strengths` 鍜?`issues` 瑕佺畝娲併€佸叿浣撱€?"""
+你是严格的“简历改写质量评审员”。请对改写结果打分（0-100）。
+评分维度：
+- faithfulness_score：与原始简历事实一致性。
+- jd_alignment_score：与 JD 要求和职责的对齐程度。
+- impact_score：动作与结果表达及量化程度。
+- readability_score：可读性与简洁度。
+- ats_score：关键词覆盖与 ATS 友好度。
+- overall_score：综合评分。
+`strengths` 和 `issues` 必须简洁、具体、可验证。
+"""
 
     user_prompt = (
-        f"绠€鍘嗘暟鎹細\n{user_info.model_dump_json(indent=2, ensure_ascii=False)}\n\n"
-        f"JD 鏁版嵁锛歕n{jd_info.model_dump_json(indent=2, ensure_ascii=False)}\n\n"
-        f"鏄犲皠杈撳嚭锛歕n{mapping.model_dump_json(indent=2, ensure_ascii=False)}\n\n"
-        f"鏀瑰啓缁撴灉锛歕n{optimized_resume.model_dump_json(indent=2, ensure_ascii=False)}"
+        f"简历数据：\n{user_info.model_dump_json(indent=2, ensure_ascii=False)}\n\n"
+        f"JD 数据：\n{jd_info.model_dump_json(indent=2, ensure_ascii=False)}\n\n"
+        f"映射输出：\n{mapping.model_dump_json(indent=2, ensure_ascii=False)}\n\n"
+        f"改写结果：\n{optimized_resume.model_dump_json(indent=2, ensure_ascii=False)}"
     )
 
     raw_data = call_deepseek_structured(

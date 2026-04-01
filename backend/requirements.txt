@@ -1,15 +1,10 @@
 fastapi
 uvicorn
-langchain>=0.2.0
-langchain-core>=0.2.0
-langchain-community>=0.2.0
 langchain-openai>=0.1.0
-langgraph
 pydantic
 python-dotenv
 openai
 qdrant-client==1.17.1
-mcp
 requests
 sqlalchemy
 pymysql

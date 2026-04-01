@@ -412,7 +412,7 @@ export function ProfilePage() {
                 <span>JD 标题</span>
                 <input
                   maxLength={120}
-                  placeholder="例如：AI 应用开发实习生"
+                  placeholder="例如：腾讯AI 应用开发实习生"
                   value={jdTitle}
                   onChange={(event) => setJdTitle(event.target.value)}
                 />

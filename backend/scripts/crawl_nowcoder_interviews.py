@@ -1,4 +1,5 @@
-﻿from __future__ import annotations
+﻿#爬虫，爬虫牛客(https://www.nowcoder.com/)的面经帖子，使用公开的JSON API，无需登录。
+from __future__ import annotations
 
 import argparse
 import json
@@ -14,12 +15,15 @@ from urllib.parse import quote
 
 import requests
 
+# 公开搜索/详情接口地址（通过网页请求逆向得到）
 SEARCH_API_URL = "https://gw-c.nowcoder.com/api/sparta/pc/search"
 LONG_CONTENT_DETAIL_API_URL = "https://gw-c.nowcoder.com/api/sparta/detail/content-data/detail/{content_id}"
 MOMENT_DETAIL_API_URL = "https://gw-c.nowcoder.com/api/sparta/detail/moment-data/detail/{uuid}"
+# contentType 枚举：250=长帖，74=动态帖
 CONTENT_TYPE_LONG_CONTENT = 250
 CONTENT_TYPE_MOMENT = 74
 
+# 请求头尽量模拟浏览器，降低接口兼容问题
 DEFAULT_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -29,22 +33,33 @@ DEFAULT_HEADERS = {
     "Origin": "https://www.nowcoder.com",
 }
 
+# 默认关键词：命令行未传 --query 时使用
 DEFAULT_QUERIES = [
-    "Java \u9762\u7ecf",
-    "\u540e\u7aef \u9762\u7ecf",
-    "\u7b97\u6cd5 \u9762\u7ecf",
-    "AI\u5e94\u7528\u5f00\u53d1 \u9762\u7ecf",
-    "\u5927\u6a21\u578b\u7b97\u6cd5 \u9762\u7ecf",
-    "\u5927\u6a21\u578b\u5f00\u53d1 \u9762\u7ecf",
-    "\u6d4b\u8bd5\u5f00\u53d1 \u9762\u7ecf",
-    "\u524d\u7aef \u9762\u7ecf",
+    "Java \u9762\u7ecf",  #Java面经
+    "Python \u9762\u7ecf", #Python面经
+    "C++ \u9762\u7ecf", #C++面经
+    "Go \u9762\u7ecf", #Go面经
+    "AI \u9762\u7ecf", #AI面经
+    "Agent \u9762\u7ecf", #Agent面经
+    "\u540e\u7aef \u9762\u7ecf", #后端面经
+    "\u7b97\u6cd5 \u9762\u7ecf", #算法面经
+    "AI\u5e94\u7528\u5f00\u53d1 \u9762\u7ecf", #AI应用开发面经
+    "\u5927\u6a21\u578b\u7b97\u6cd5 \u9762\u7ecf", #大模型算法面经
+    "\u5927\u6a21\u578b\u5f00\u53d1 \u9762\u7ecf", #大模型开发面经
+    "\u6d4b\u8bd5\u5f00\u53d1 \u9762\u7ecf", #测试开发面经
+    "\u524d\u7aef \u9762\u7ecf", #前端面经
+    "\u6570\u636e\u5e93 \u9762\u7ecf", #数据库面经
 ]
 
 class NowcoderCrawlerError(RuntimeError):
+    """爬虫过程中的业务异常。"""
+
     pass
 
 
 class HTMLTextExtractor(HTMLParser):
+    """将 HTML/richText 提取为纯文本。"""
+
     BLOCK_TAGS = {
         "article",
         "blockquote",
@@ -85,6 +100,7 @@ class HTMLTextExtractor(HTMLParser):
             self.parts.append(data)
 
     def get_text(self) -> str:
+        # 统一空白与换行，避免脏文本影响后续抽取
         text = unescape("".join(self.parts))
         text = text.replace("\r", "\n")
         text = re.sub(r"\n{3,}", "\n\n", text)
@@ -96,6 +112,8 @@ class HTMLTextExtractor(HTMLParser):
 
 @dataclass(frozen=True)
 class SearchHit:
+    """搜索阶段的标准化命中对象，用于后续详情抓取。"""
+
     query: str
     page: int
     content_type: int
@@ -113,6 +131,8 @@ class SearchHit:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """定义命令行参数。"""
+
     parser = argparse.ArgumentParser(description="Crawl Nowcoder interview posts via public JSON APIs.")
     parser.add_argument(
         "--query",
@@ -134,6 +154,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def timestamp_ms_to_iso(value: Any) -> str | None:
+    """将毫秒时间戳转成 UTC ISO 字符串。"""
+
     if value is None:
         return None
     try:
@@ -144,6 +166,8 @@ def timestamp_ms_to_iso(value: Any) -> str | None:
 
 
 def rich_text_to_plain_text(value: str | None) -> str:
+    """富文本清洗入口：HTML -> 可读纯文本。"""
+
     if not value:
         return ""
     extractor = HTMLTextExtractor()
@@ -153,6 +177,8 @@ def rich_text_to_plain_text(value: str | None) -> str:
 
 
 def clean_text(value: str | None) -> str:
+    """轻量文本清洗：反转义、压缩空白、去首尾。"""
+
     if not value:
         return ""
     text = unescape(value).replace("\r", "\n")
@@ -162,28 +188,40 @@ def clean_text(value: str | None) -> str:
 
 
 def slugify_query(query: str) -> str:
+    """把查询词转成可落盘的文件名片段。"""
+
     slug = re.sub(r"[^\w\u4e00-\u9fff-]+", "_", query.strip())
     return slug.strip("_") or "query"
 
 
 def dump_json(path: Path, payload: Any) -> None:
+    """写 JSON 文件（UTF-8 + 缩进）。"""
+
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def load_json(path: Path) -> Any:
+    """读 JSON 文件。"""
+
     return json.loads(path.read_text(encoding="utf-8"))
 
 
 def build_search_filename(query: str, page: int) -> str:
+    """原始搜索响应文件名。"""
+
     return f"search__{slugify_query(query)}__page_{page}.json"
 
 
 def build_detail_filename(hit: SearchHit) -> str:
+    """原始详情响应文件名。"""
+
     return f"detail__{hit.detail_kind}__{hit.detail_lookup_key}.json"
 
 
 class NowcoderCrawler:
+    """封装搜索、详情抓取与归一化输出。"""
+
     def __init__(self, output_dir: Path, sleep_seconds: float, force: bool = False) -> None:
         self.output_dir = output_dir
         self.sleep_seconds = sleep_seconds
@@ -193,6 +231,8 @@ class NowcoderCrawler:
         self.session.headers.update(DEFAULT_HEADERS)
 
     def search_posts(self, query: str, page: int, page_size: int) -> tuple[list[SearchHit], dict[str, Any]]:
+        """分页搜索帖子，返回命中列表和原始响应。"""
+
         payload = {
             "query": query,
             "type": "post",
@@ -222,6 +262,8 @@ class NowcoderCrawler:
         return hits, result
 
     def _normalize_search_hit(self, query: str, page: int, record: dict[str, Any]) -> SearchHit | None:
+        """按 contentType 把原始 record 归一化成 SearchHit。"""
+
         content_type = int(record.get("contentType") or 0)
         user_brief = record.get("userBrief") or {}
 
@@ -276,6 +318,8 @@ class NowcoderCrawler:
         return None
 
     def fetch_detail(self, hit: SearchHit) -> tuple[dict[str, Any], Path]:
+        """抓取单条详情；若本地缓存存在则直接复用。"""
+
         detail_path = self.raw_json_dir / build_detail_filename(hit)
         if detail_path.exists() and not self.force:
             return load_json(detail_path), detail_path
@@ -309,6 +353,8 @@ class NowcoderCrawler:
         detail_path: Path,
         search_path: Path,
     ) -> dict[str, Any]:
+        """把不同接口字段映射到统一结构，供后续流水线使用。"""
+
         data = detail_payload.get("data") or {}
         user_brief = data.get("userBrief") or hit.search_record.get("userBrief") or {}
 
@@ -394,6 +440,8 @@ class NowcoderCrawler:
 
 
 def nested_get(payload: dict[str, Any], path: list[str]) -> Any:
+    """安全读取嵌套字典路径，缺失时返回 None。"""
+
     current: Any = payload
     for key in path:
         if not isinstance(current, dict):
@@ -403,6 +451,8 @@ def nested_get(payload: dict[str, Any], path: list[str]) -> Any:
 
 
 def write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
+    """按 JSONL 写出标准化记录（每行一条 JSON）。"""
+
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
         for record in records:
@@ -411,6 +461,8 @@ def write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
 
 
 def main() -> int:
+    """主流程：搜索 -> 详情 -> 去重 -> 归一化 -> 落盘。"""
+
     parser = build_parser()
     args = parser.parse_args()
     queries = args.queries or DEFAULT_QUERIES
@@ -421,6 +473,7 @@ def main() -> int:
     seen_keys: set[tuple[str, str]] = set()
     raw_search_paths: list[str] = []
 
+    # 先按关键词分页抓搜索结果，再逐条补详情
     for query in queries:
         for page in range(1, args.page_limit + 1):
             hits, raw_search = crawler.search_posts(query=query, page=page, page_size=args.page_size)
@@ -432,6 +485,7 @@ def main() -> int:
                 continue
 
             for hit in hits:
+                # 去重键：detail_kind + detail_lookup_key
                 unique_key = (hit.detail_kind, hit.detail_lookup_key)
                 if unique_key in seen_keys:
                     continue
@@ -447,6 +501,7 @@ def main() -> int:
                 )
                 seen_keys.add(unique_key)
 
+                # 到达条数上限时提前停止
                 if args.max_items and len(normalized_records) >= args.max_items:
                     break
 

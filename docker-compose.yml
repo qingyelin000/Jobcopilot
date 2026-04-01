@@ -29,9 +29,11 @@ services:
     volumes:
       - qdrant_dev_data:/qdrant/storage
 
-  # === 1. 核心 AI 中枢控制服务 ===
   backend:
-    build: ./backend
+    build:
+      context: ./backend
+      args:
+        PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.10-slim}
     container_name: jobcopilot_backend
     command: uvicorn api:app --host 0.0.0.0 --port 8000 --reload
     ports:
@@ -48,7 +50,6 @@ services:
       - MIMO_MODEL=${MIMO_MODEL:-mimo-v2-pro}
       - MIMO_MAP_MODEL=${MIMO_MAP_MODEL:-}
       - MIMO_REWRITE_MODEL=${MIMO_REWRITE_MODEL:-}
-      - MCP_SERVER_URL=http://mcp_server:8001/sse # 向后端告知爬虫节点的内部地址
       - DATABASE_URL=${DATABASE_URL}
       - JWT_SECRET=${JWT_SECRET}
       - JWT_EXPIRE_MINUTES=${JWT_EXPIRE_MINUTES}
@@ -58,39 +59,29 @@ services:
       - QDRANT_URL=${QDRANT_URL:-http://qdrant:6333}
       - QDRANT_API_KEY=${QDRANT_API_KEY:-}
       - QDRANT_COLLECTION=${QDRANT_COLLECTION:-nowcoder_interview_questions_v1}
-      - EMBEDDING_PROVIDER=${EMBEDDING_PROVIDER:-hash}
-      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-}
-      - EMBEDDING_BASE_URL=${EMBEDDING_BASE_URL:-}
+      - EMBEDDING_PROVIDER=${EMBEDDING_PROVIDER:-openai_compatible}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-BAAI/bge-m3}
+      - EMBEDDING_BASE_URL=${EMBEDDING_BASE_URL:-https://api.siliconflow.cn/v1}
       - EMBEDDING_API_KEY=${EMBEDDING_API_KEY:-}
+      - RERANK_ENABLED=${RERANK_ENABLED:-true}
+      - RERANK_MODEL=${RERANK_MODEL:-BAAI/bge-reranker-v2-m3}
+      - RERANK_BASE_URL=${RERANK_BASE_URL:-https://api.siliconflow.cn/v1}
+      - RERANK_API_KEY=${RERANK_API_KEY:-}
+      - RERANK_TIMEOUT_SECONDS=${RERANK_TIMEOUT_SECONDS:-15}
+      - RERANK_CANDIDATE_POOL=${RERANK_CANDIDATE_POOL:-40}
     depends_on:
       mysql:
         condition: service_healthy
       qdrant:
         condition: service_started
-      mcp_server:
-        condition: service_started
     restart: unless-stopped
 
-  # === 2. MCP Server (提供获取位置、爬取Boss直聘工具) ===
-  mcp_server:
-    build: ./mcp_server
-    container_name: jobcopilot_mcp_server
-    ports:
-      - "8001:8001"
-    volumes:
-      - ./mcp_server:/app
-    environment:
-      - GEO_PROVIDER=${GEO_PROVIDER}
-      - GEO_AMAP_KEY=${GEO_AMAP_KEY}
-      - GEO_IPINFO_TOKEN=${GEO_IPINFO_TOKEN}
-      - GEO_DEFAULT_CITY=${GEO_DEFAULT_CITY}
-    restart: unless-stopped
-
-  # === 3. 大屏前端服务 ===
   frontend:
     build:
       context: ./frontend
       args:
+        NODE_IMAGE: ${NODE_IMAGE:-node:22-alpine}
+        NGINX_IMAGE: ${NGINX_IMAGE:-nginx:1.27-alpine}
         NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmjs.org/}
         NPM_REGISTRY_FALLBACK: ${NPM_REGISTRY_FALLBACK:-https://registry.npmmirror.com/}
     container_name: jobcopilot_frontend

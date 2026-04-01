@@ -7,6 +7,7 @@ import os
 import re
 from pathlib import Path
 
+import requests
 from qdrant_client import QdrantClient, models
 
 from .embedding_utils import (
@@ -15,11 +16,12 @@ from .embedding_utils import (
     default_embedding_provider_name,
     tokenize_for_embedding,
 )
-from .retriever_v1 import (
+from .lexical_retriever import (
     DEFAULT_DATASET_PATH,
+    LexicalRetriever,
     RetrievalQuestion,
     RetrievedQuestion,
-    RetrieverV1,
+    serialize_retrieved_question,
 )
 
 
@@ -32,12 +34,21 @@ DEFAULT_QDRANT_COLLECTION = (
     or "nowcoder_interview_questions_v1"
 )
 
+DEFAULT_RERANK_BASE_URL = (
+    os.getenv("RERANK_BASE_URL", "https://api.siliconflow.cn/v1").strip()
+    or "https://api.siliconflow.cn/v1"
+)
+DEFAULT_RERANK_MODEL = (
+    os.getenv("RERANK_MODEL", "BAAI/bge-reranker-v2-m3").strip()
+    or "BAAI/bge-reranker-v2-m3"
+)
+
 
 @dataclass(frozen=True)
 class _Candidate:
     question: RetrievalQuestion
-    vector_rank: int | None
-    vector_score_raw: float
+    dense_rank: int | None
+    dense_score_raw: float
     lexical_rank: int | None
     lexical_score_raw: float
 
@@ -127,6 +138,27 @@ def _jaccard_similarity(left: set[str], right: set[str]) -> float:
     return len(left & right) / len(union)
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    raw = str(os.getenv(name, "")).strip().lower()
+    if not raw:
+        return bool(default)
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return bool(default)
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = str(os.getenv(name, "")).strip()
+    if not raw:
+        return float(default)
+    try:
+        return float(raw)
+    except ValueError:
+        return float(default)
+
+
 class RetrieverV2:
     def __init__(
         self,
@@ -143,6 +175,12 @@ class RetrieverV2:
         vector_candidate_pool: int = 64,
         lexical_candidate_pool: int = 40,
         strict_metadata_filter: bool = False,
+        rerank_enabled: bool | None = None,
+        rerank_model: str | None = None,
+        rerank_api_key: str | None = None,
+        rerank_base_url: str | None = None,
+        rerank_timeout_seconds: float | None = None,
+        rerank_candidate_pool: int = 40,
     ) -> None:
         self.dataset_path = Path(dataset_path)
         self.collection_name = collection_name
@@ -150,7 +188,8 @@ class RetrieverV2:
         self.lexical_candidate_pool = max(int(lexical_candidate_pool), 8)
         self.strict_metadata_filter = bool(strict_metadata_filter)
 
-        self.lexical_retriever = RetrieverV1(dataset_path=self.dataset_path)
+        # 混合检索：词法分支负责可解释匹配，向量分支负责语义召回。
+        self.lexical_retriever = LexicalRetriever(dataset_path=self.dataset_path)
         self.embedding_provider = build_embedding_provider(
             provider_name=embedding_provider,
             embedding_model=embedding_model,
@@ -162,6 +201,30 @@ class RetrieverV2:
             url=qdrant_url,
             api_key=(qdrant_api_key or "").strip() or None,
         )
+
+        self.rerank_enabled = (
+            _env_flag("RERANK_ENABLED", default=True)
+            if rerank_enabled is None
+            else bool(rerank_enabled)
+        )
+        self.rerank_model = (rerank_model or "").strip() or DEFAULT_RERANK_MODEL
+        self.rerank_base_url = (rerank_base_url or "").strip() or DEFAULT_RERANK_BASE_URL
+        self.rerank_api_key = (
+            (rerank_api_key or "").strip()
+            or os.getenv("RERANK_API_KEY", "").strip()
+            or os.getenv("EMBEDDING_API_KEY", "").strip()
+            or os.getenv("OPENAI_API_KEY", "").strip()
+            or ""
+        )
+        timeout_value = (
+            float(rerank_timeout_seconds)
+            if rerank_timeout_seconds is not None
+            else _env_float("RERANK_TIMEOUT_SECONDS", 15.0)
+        )
+        self.rerank_timeout_seconds = max(float(timeout_value), 1.0)
+        self.rerank_candidate_pool = max(int(rerank_candidate_pool), 8)
+        if not self.rerank_api_key:
+            self.rerank_enabled = False
 
     @staticmethod
     def _question_from_payload(payload: dict) -> RetrievalQuestion:
@@ -184,6 +247,7 @@ class RetrieverV2:
         target_role: str | None,
         strict_metadata_filter: bool,
     ) -> models.Filter | None:
+        # strict 模式下在向量召回阶段直接按公司/岗位过滤，降低误召回。
         if not strict_metadata_filter:
             return None
         must_conditions: list[models.FieldCondition] = []
@@ -205,41 +269,40 @@ class RetrieverV2:
             return None
         return models.Filter(must=must_conditions)
 
-    def _vector_candidates(
+    def _build_query_vector(
         self,
         *,
         resume_text: str,
         jd_text: str,
         extra_query: str | None,
-        target_company: str | None,
-        target_role: str | None,
-        strict_metadata_filter: bool,
-    ) -> list[tuple[RetrievalQuestion, float]]:
+    ) -> list[float]:
         query_text = compose_query_embedding_text(
             resume_text=resume_text,
             jd_text=jd_text,
             extra_query=extra_query,
         )
-        query_vector = self.embedding_provider.embed_texts([query_text])[0]
-        query_filter = self._build_qdrant_filter(
-            target_company=target_company,
-            target_role=target_role,
-            strict_metadata_filter=strict_metadata_filter,
-        )
+        return self.embedding_provider.embed_texts([query_text])[0]
 
-        def _extract_points(result: object) -> list[object]:
-            if result is None:
-                return []
-            if isinstance(result, list):
-                return result
-            points = getattr(result, "points", None)
-            if isinstance(points, list):
-                return points
-            legacy = getattr(result, "result", None)
-            if isinstance(legacy, list):
-                return legacy
+    @staticmethod
+    def _extract_points(result: object) -> list[object]:
+        if result is None:
             return []
+        if isinstance(result, list):
+            return result
+        points = getattr(result, "points", None)
+        if isinstance(points, list):
+            return points
+        legacy = getattr(result, "result", None)
+        if isinstance(legacy, list):
+            return legacy
+        return []
 
+    def _search_dense_candidates(
+        self,
+        *,
+        query_vector: list[float],
+        query_filter: models.Filter | None,
+    ) -> list[tuple[RetrievalQuestion, float]]:
         common_kwargs = {
             "collection_name": self.collection_name,
             "limit": self.vector_candidate_pool,
@@ -248,28 +311,36 @@ class RetrieverV2:
         }
 
         hits: list[object] = []
-        if hasattr(self.client, "search"):
+        query_kwargs = dict(common_kwargs)
+        query_kwargs["query_filter"] = query_filter
+
+        # 兼容不同 qdrant-client 版本：优先 query_points，必要时降级到 search。
+        if hasattr(self.client, "query_points"):
+            try:
+                response = self.client.query_points(query=query_vector, using="dense", **query_kwargs)
+                hits = self._extract_points(response)
+            except Exception:
+                try:
+                    response = self.client.query_points(query=query_vector, **query_kwargs)
+                    hits = self._extract_points(response)
+                except Exception:
+                    hits = []
+
+        if not hits and hasattr(self.client, "search"):
             search_kwargs = dict(common_kwargs)
             search_kwargs["query_filter"] = query_filter
             try:
-                hits = _extract_points(self.client.search(query_vector=query_vector, **search_kwargs))
-            except TypeError:
-                # Compatibility fallback for older/newer qdrant-client signatures.
-                hits = _extract_points(self.client.search(vector=query_vector, **search_kwargs))
-        else:
-            query_kwargs = dict(common_kwargs)
-            query_kwargs["query_filter"] = query_filter
-            try:
-                response = self.client.query_points(query=query_vector, **query_kwargs)
-            except TypeError:
+                response = self.client.search(
+                    query_vector=models.NamedVector(name="dense", vector=query_vector),  # type: ignore[arg-type]
+                    **search_kwargs,
+                )
+                hits = self._extract_points(response)
+            except Exception:
                 try:
-                    response = self.client.query_points(query_vector=query_vector, **query_kwargs)
-                except TypeError:
-                    # Some versions use `filter` instead of `query_filter`.
-                    query_kwargs.pop("query_filter", None)
-                    query_kwargs["filter"] = query_filter
-                    response = self.client.query_points(query=query_vector, **query_kwargs)
-            hits = _extract_points(response)
+                    response = self.client.search(query_vector=query_vector, **search_kwargs)
+                    hits = self._extract_points(response)
+                except Exception:
+                    hits = []
 
         results: list[tuple[RetrievalQuestion, float]] = []
         for hit in hits:
@@ -287,13 +358,14 @@ class RetrieverV2:
         resume_text: str,
         jd_text: str,
         extra_query: str | None,
-    ) -> list[RetrievedQuestion]:
-        return self.lexical_retriever.search(
+    ) -> list[tuple[RetrievalQuestion, float]]:
+        lexical_hits = self.lexical_retriever.search(
             resume_text=resume_text,
             jd_text=jd_text,
             top_k=self.lexical_candidate_pool,
             extra_query=extra_query,
         )
+        return [(item.question, float(item.score)) for item in lexical_hits]
 
     @staticmethod
     def _extract_anchor_terms(
@@ -304,6 +376,7 @@ class RetrieverV2:
         target_company: str | None,
         target_role: str | None,
     ) -> set[str]:
+        # 锚点词用于计算题目与查询上下文（简历/JD/目标岗位）的词项重合度。
         merged = " ".join(
             part
             for part in (
@@ -321,6 +394,86 @@ class RetrieverV2:
             if len(token.strip()) > 1
         }
 
+    @staticmethod
+    def _compose_rerank_document(question: RetrievalQuestion) -> str:
+        parts = [
+            str(question.company or "").strip(),
+            str(question.role or "").strip(),
+            str(question.question_type or "").strip(),
+            str(question.question_text or "").strip(),
+        ]
+        return " | ".join(part for part in parts if part)
+
+    @staticmethod
+    def _compose_rerank_query(
+        *,
+        resume_text: str,
+        jd_text: str,
+        extra_query: str | None,
+        target_company: str | None,
+        target_role: str | None,
+    ) -> str:
+        base = compose_query_embedding_text(
+            resume_text=resume_text,
+            jd_text=jd_text,
+            extra_query=extra_query,
+        )
+        tail = " ".join(part for part in (target_company or "", target_role or "") if part).strip()
+        if tail:
+            return f"{base}\n{tail}".strip()
+        return base
+
+    def _call_rerank_api(self, *, query: str, documents: list[str]) -> list[float] | None:
+        if not self.rerank_enabled or not self.rerank_api_key or not query.strip() or not documents:
+            return None
+        url = f"{self.rerank_base_url.rstrip('/')}/rerank"
+        headers = {
+            "Authorization": f"Bearer {self.rerank_api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": self.rerank_model,
+            "query": query,
+            "documents": documents,
+            "top_n": len(documents),
+            "return_documents": False,
+        }
+        try:
+            response = requests.post(url, json=payload, headers=headers, timeout=self.rerank_timeout_seconds)
+            response.raise_for_status()
+            body = response.json()
+        except Exception:
+            return None
+
+        scores = [0.0] * len(documents)
+        raw_results = body.get("results")
+        if raw_results is None and isinstance(body.get("data"), dict):
+            raw_results = body["data"].get("results")
+        if not isinstance(raw_results, list):
+            return None
+
+        any_score = False
+        for item in raw_results:
+            if not isinstance(item, dict):
+                continue
+            score_raw = item.get("relevance_score", item.get("score"))
+            try:
+                score = float(score_raw)
+            except (TypeError, ValueError):
+                continue
+            index_raw = item.get("index")
+            if index_raw is None:
+                continue
+            try:
+                index = int(index_raw)
+            except (TypeError, ValueError):
+                continue
+            if index < 0 or index >= len(documents):
+                continue
+            scores[index] = score
+            any_score = True
+        return scores if any_score else None
+
     def search(
         self,
         *,
@@ -333,13 +486,19 @@ class RetrieverV2:
         strict_metadata_filter: bool | None = None,
     ) -> list[RetrievedQuestion]:
         use_strict_filter = self.strict_metadata_filter if strict_metadata_filter is None else strict_metadata_filter
-        vector_hits = self._vector_candidates(
-            resume_text=resume_text,
-            jd_text=jd_text,
-            extra_query=extra_query,
+        query_filter = self._build_qdrant_filter(
             target_company=target_company,
             target_role=target_role,
             strict_metadata_filter=use_strict_filter,
+        )
+        dense_query = self._build_query_vector(
+            resume_text=resume_text,
+            jd_text=jd_text,
+            extra_query=extra_query,
+        )
+        dense_hits = self._search_dense_candidates(
+            query_vector=dense_query,
+            query_filter=query_filter,
         )
         lexical_hits = self._lexical_candidates(
             resume_text=resume_text,
@@ -348,39 +507,39 @@ class RetrieverV2:
         )
 
         merged: dict[str, _Candidate] = {}
-        for rank, (question, score) in enumerate(vector_hits, start=1):
+        for rank, (question, score) in enumerate(dense_hits, start=1):
             merged[question.question_id] = _Candidate(
                 question=question,
-                vector_rank=rank,
-                vector_score_raw=score,
+                dense_rank=rank,
+                dense_score_raw=score,
                 lexical_rank=None,
                 lexical_score_raw=0.0,
             )
 
-        for rank, item in enumerate(lexical_hits, start=1):
-            existing = merged.get(item.question.question_id)
+        for rank, (question, score) in enumerate(lexical_hits, start=1):
+            existing = merged.get(question.question_id)
             if existing is None:
-                merged[item.question.question_id] = _Candidate(
-                    question=item.question,
-                    vector_rank=None,
-                    vector_score_raw=0.0,
+                merged[question.question_id] = _Candidate(
+                    question=question,
+                    dense_rank=None,
+                    dense_score_raw=0.0,
                     lexical_rank=rank,
-                    lexical_score_raw=float(item.score),
+                    lexical_score_raw=float(score),
                 )
                 continue
-            merged[item.question.question_id] = _Candidate(
+            merged[question.question_id] = _Candidate(
                 question=existing.question,
-                vector_rank=existing.vector_rank,
-                vector_score_raw=existing.vector_score_raw,
+                dense_rank=existing.dense_rank,
+                dense_score_raw=existing.dense_score_raw,
                 lexical_rank=rank,
-                lexical_score_raw=float(item.score),
+                lexical_score_raw=float(score),
             )
 
         candidates = list(merged.values())
         if not candidates:
             return []
 
-        normalized_vector_scores = _normalize_scores([candidate.vector_score_raw for candidate in candidates])
+        normalized_dense_scores = _normalize_scores([candidate.dense_score_raw for candidate in candidates])
         normalized_lexical_scores = _normalize_scores([candidate.lexical_score_raw for candidate in candidates])
         now_utc = datetime.now(timezone.utc)
         anchor_terms = self._extract_anchor_terms(
@@ -391,12 +550,56 @@ class RetrieverV2:
             target_role=target_role,
         )
 
+        rough_scores: list[float] = []
+        for index, candidate in enumerate(candidates):
+            dense_score = normalized_dense_scores[index]
+            lexical_score = normalized_lexical_scores[index]
+            rrf_score = _rank_score(candidate.dense_rank) + _rank_score(candidate.lexical_rank)
+            # 粗排仅用于筛选 rerank 候选，不直接作为最终输出分。
+            rough_scores.append(0.55 * dense_score + 0.25 * lexical_score + 0.20 * rrf_score)
+
+        rerank_raw_scores = [0.0] * len(candidates)
+        if self.rerank_enabled and candidates:
+            rerank_query = self._compose_rerank_query(
+                resume_text=resume_text,
+                jd_text=jd_text,
+                extra_query=extra_query,
+                target_company=target_company,
+                target_role=target_role,
+            )
+            rerank_limit = min(self.rerank_candidate_pool, len(candidates))
+            # 只对粗排 TopN 做重排，控制延迟与调用成本。
+            selected_indexes = sorted(
+                range(len(candidates)),
+                key=lambda idx: rough_scores[idx],
+                reverse=True,
+            )[:rerank_limit]
+            rerank_documents = [
+                self._compose_rerank_document(candidates[idx].question)
+                for idx in selected_indexes
+            ]
+            rerank_scores = self._call_rerank_api(
+                query=rerank_query,
+                documents=rerank_documents,
+            )
+            if rerank_scores is not None:
+                for local_idx, score in enumerate(rerank_scores):
+                    if local_idx >= len(selected_indexes):
+                        break
+                    rerank_raw_scores[selected_indexes[local_idx]] = max(float(score), 0.0)
+
+        if any(score > 0.0 for score in rerank_raw_scores):
+            normalized_rerank_scores = _normalize_scores(rerank_raw_scores)
+        else:
+            normalized_rerank_scores = [0.0] * len(candidates)
+
         rescored: list[RetrievedQuestion] = []
         for index, candidate in enumerate(candidates):
             question = candidate.question
-            semantic_score = normalized_vector_scores[index]
+            dense_score = normalized_dense_scores[index]
             lexical_score = normalized_lexical_scores[index]
-            rrf_score = _rank_score(candidate.vector_rank) + _rank_score(candidate.lexical_rank)
+            rerank_score = normalized_rerank_scores[index]
+            rrf_score = _rank_score(candidate.dense_rank) + _rank_score(candidate.lexical_rank)
             role_score = 1.0 if (target_role and _soft_match(target_role, question.role)) else 0.0
             company_score = 1.0 if (target_company and _soft_match(target_company, question.company)) else 0.0
 
@@ -414,13 +617,15 @@ class RetrieverV2:
             )
             freshness_score = _freshness_score(question.publish_time, now_utc=now_utc)
 
-            # Weight priority: question_text relevance > role > company > freshness.
+            # Dense 召回 + 词法召回 + RRF + 简历对齐 + 二阶段 rerank 融合。
             text_relevance_score = (
-                0.50 * semantic_score
-                + 0.20 * lexical_score
+                0.36 * dense_score
+                + 0.18 * lexical_score
                 + 0.10 * rrf_score
-                + 0.20 * resume_align_score
+                + 0.16 * resume_align_score
+                + 0.20 * rerank_score
             )
+            # 最终分：文本相关性为主，再叠加公司/岗位匹配与时效性。
             final_score = (
                 0.70 * text_relevance_score
                 + 0.16 * role_score
@@ -435,9 +640,12 @@ class RetrieverV2:
                     matched_keywords=[],
                     score_breakdown={
                         "text_relevance": round(text_relevance_score, 6),
-                        "semantic": round(semantic_score, 6),
+                        "dense": round(dense_score, 6),
                         "lexical": round(lexical_score, 6),
+                        # backward-compat: old clients may still read "sparse" key.
+                        "sparse": round(lexical_score, 6),
                         "rrf": round(rrf_score, 6),
+                        "rerank": round(rerank_score, 6),
                         "role": round(role_score, 6),
                         "company": round(company_score, 6),
                         "resume_align": round(resume_align_score, 6),
@@ -472,7 +680,7 @@ class RetrieverV2:
                     if similarity > max_similarity:
                         max_similarity = similarity
 
-                # Penalize semantically similar questions to control duplicate rate.
+                # 对语义高度相似的问题施加惩罚，降低重复题比例。
                 duplicate_penalty = 0.22 * max_similarity
                 adjusted_score = item.score - duplicate_penalty
                 if adjusted_score > best_adjusted_score:

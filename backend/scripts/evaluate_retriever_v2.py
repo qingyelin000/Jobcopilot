@@ -16,8 +16,8 @@ if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
 from interview.embedding_utils import default_embedding_provider_name
-from interview.retriever_v1 import DEFAULT_DATASET_PATH, RetrieverV1
 from interview.retriever_v2 import (
+    DEFAULT_DATASET_PATH,
     DEFAULT_QDRANT_COLLECTION,
     DEFAULT_QDRANT_URL,
     RetrieverV2,
@@ -75,7 +75,7 @@ class EvalCase:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Evaluate RetrieverV1 quality with labeled cases (JSONL).",
+        description="Evaluate RetrieverV2 quality with labeled cases (JSONL).",
     )
     parser.add_argument(
         "--cases",
@@ -85,7 +85,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dataset",
         default=str(DEFAULT_DATASET_PATH),
-        help="Retrieval dataset path used by RetrieverV1.",
+        help="Retrieval dataset path used by RetrieverV2 lexical branch.",
     )
     parser.add_argument(
         "--top-k",
@@ -113,7 +113,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--output",
-        default="data/nowcoder/pipeline_runs_llm/retriever_v1_eval_report.json",
+        default="data/nowcoder/pipeline_runs_llm/retriever_v2_eval_report.json",
         help="Evaluation report JSON output path.",
     )
     parser.add_argument(
@@ -126,12 +126,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--strict",
         action="store_true",
         help="Fail fast on invalid case format instead of skipping.",
-    )
-    parser.add_argument(
-        "--retriever-backend",
-        default="v1",
-        choices=["v1", "v2"],
-        help="Retriever backend to evaluate.",
     )
     parser.add_argument("--qdrant-url", default=DEFAULT_QDRANT_URL, help="Qdrant URL for RetrieverV2.")
     parser.add_argument("--qdrant-api-key", default="", help="Optional Qdrant API key for RetrieverV2.")
@@ -504,27 +498,18 @@ def evaluate_case(
     case: EvalCase,
     *,
     retriever: Any,
-    retriever_backend: str,
     min_relevance: float,
     freshness_half_life_days: float,
     now_utc: datetime,
 ) -> dict[str, Any]:
-    if retriever_backend == "v2":
-        results = retriever.search(
-            resume_text=case.resume_text,
-            jd_text=case.jd_text,
-            top_k=case.top_k,
-            extra_query=case.query or None,
-            target_company=case.target_company or None,
-            target_role=case.target_role or None,
-        )
-    else:
-        results = retriever.search(
-            resume_text=case.resume_text,
-            jd_text=case.jd_text,
-            top_k=case.top_k,
-            extra_query=case.query or None,
-        )
+    results = retriever.search(
+        resume_text=case.resume_text,
+        jd_text=case.jd_text,
+        top_k=case.top_k,
+        extra_query=case.query or None,
+        target_company=case.target_company or None,
+        target_role=case.target_role or None,
+    )
     ranked = results[: case.top_k]
     ranked_ids = [item.question.question_id for item in ranked]
     ranked_scores = [case.relevance.get(qid, 0.0) for qid in ranked_ids]
@@ -710,30 +695,26 @@ def main() -> int:
     if not cases:
         raise ValueError("No valid evaluation cases loaded.")
 
-    if args.retriever_backend == "v2":
-        retriever = RetrieverV2(
-            dataset_path=dataset_path,
-            qdrant_url=args.qdrant_url,
-            qdrant_api_key=args.qdrant_api_key or None,
-            collection_name=args.qdrant_collection,
-            embedding_provider=args.embedding_provider,
-            embedding_model=args.embedding_model or None,
-            embedding_api_key=args.embedding_api_key or None,
-            embedding_base_url=args.embedding_base_url or None,
-            embedding_dimension=max(args.embedding_dimension, 1),
-            vector_candidate_pool=max(args.vector_candidate_pool, 8),
-            lexical_candidate_pool=max(args.lexical_candidate_pool, 8),
-            strict_metadata_filter=bool(args.strict_metadata_filter),
-        )
-    else:
-        retriever = RetrieverV1(dataset_path=dataset_path)
+    retriever = RetrieverV2(
+        dataset_path=dataset_path,
+        qdrant_url=args.qdrant_url,
+        qdrant_api_key=args.qdrant_api_key or None,
+        collection_name=args.qdrant_collection,
+        embedding_provider=args.embedding_provider,
+        embedding_model=args.embedding_model or None,
+        embedding_api_key=args.embedding_api_key or None,
+        embedding_base_url=args.embedding_base_url or None,
+        embedding_dimension=max(args.embedding_dimension, 1),
+        vector_candidate_pool=max(args.vector_candidate_pool, 8),
+        lexical_candidate_pool=max(args.lexical_candidate_pool, 8),
+        strict_metadata_filter=bool(args.strict_metadata_filter),
+    )
     now_utc = datetime.now(timezone.utc)
 
     per_case = [
         evaluate_case(
             case,
             retriever=retriever,
-            retriever_backend=args.retriever_backend,
             min_relevance=float(args.min_relevance),
             freshness_half_life_days=float(args.freshness_half_life_days),
             now_utc=now_utc,
@@ -762,7 +743,7 @@ def main() -> int:
         "skipped_case_count": skipped_cases,
         "dataset": str(dataset_path),
         "cases_file": str(cases_path),
-        "retriever_backend": args.retriever_backend,
+        "retriever_backend": "v2",
         "min_relevance": float(args.min_relevance),
         "freshness_half_life_days": float(args.freshness_half_life_days),
         "metrics": {

@@ -12,11 +12,12 @@ if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
 from interview.embedding_utils import default_embedding_provider_name
-from interview.retriever_v1 import DEFAULT_DATASET_PATH, serialize_retrieved_question
 from interview.retriever_v2 import (
+    DEFAULT_DATASET_PATH,
     DEFAULT_QDRANT_COLLECTION,
     DEFAULT_QDRANT_URL,
     RetrieverV2,
+    serialize_retrieved_question,
 )
 
 
@@ -51,7 +52,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["hash", "openai_compatible"],
         help="Embedding provider for query vectors.",
     )
-    parser.add_argument("--embedding-model", default="", help="Embedding model for openai_compatible provider.")
+    parser.add_argument(
+        "--embedding-model",
+        default="",
+        help="Embedding model for openai_compatible provider.",
+    )
     parser.add_argument("--embedding-api-key", default="", help="Embedding API key override.")
     parser.add_argument("--embedding-base-url", default="", help="Embedding base URL override.")
     parser.add_argument(
@@ -71,6 +76,26 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=40,
         help="Lexical recall candidate pool size.",
+    )
+    parser.add_argument(
+        "--disable-rerank",
+        action="store_true",
+        help="Disable rerank stage and keep first-stage retrieval scoring only.",
+    )
+    parser.add_argument("--rerank-model", default="", help="Optional rerank model override.")
+    parser.add_argument("--rerank-api-key", default="", help="Optional rerank API key override.")
+    parser.add_argument("--rerank-base-url", default="", help="Optional rerank API base URL override.")
+    parser.add_argument(
+        "--rerank-timeout-seconds",
+        type=float,
+        default=15.0,
+        help="Rerank API timeout in seconds.",
+    )
+    parser.add_argument(
+        "--rerank-candidate-pool",
+        type=int,
+        default=40,
+        help="Candidate pool size sent to rerank API.",
     )
     return parser
 
@@ -102,6 +127,12 @@ def main() -> int:
         vector_candidate_pool=max(args.vector_candidate_pool, args.top_k),
         lexical_candidate_pool=max(args.lexical_candidate_pool, args.top_k),
         strict_metadata_filter=bool(args.strict_metadata_filter),
+        rerank_enabled=not bool(args.disable_rerank),
+        rerank_model=args.rerank_model or None,
+        rerank_api_key=args.rerank_api_key or None,
+        rerank_base_url=args.rerank_base_url or None,
+        rerank_timeout_seconds=max(float(args.rerank_timeout_seconds), 1.0),
+        rerank_candidate_pool=max(int(args.rerank_candidate_pool), args.top_k),
     )
     results = retriever.search(
         resume_text=resume_text,

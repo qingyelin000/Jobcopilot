@@ -144,7 +144,12 @@ class OpenAICompatibleEmbeddingProvider:
 
 
 def default_embedding_provider_name() -> str:
-    return (os.getenv("EMBEDDING_PROVIDER", "hash").strip() or "hash").lower()
+    return (os.getenv("EMBEDDING_PROVIDER", "openai_compatible").strip() or "openai_compatible").lower()
+
+
+def supports_hybrid_embedding(provider: EmbeddingProvider) -> bool:
+    """保留兼容接口：当前在线 provider 不提供 hybrid 输出。"""
+    return callable(getattr(provider, "embed_hybrid_texts", None))
 
 
 def build_embedding_provider(
@@ -159,6 +164,11 @@ def build_embedding_provider(
     normalized = (provider_name or "").strip().lower()
     if normalized in {"hash", "local_hash"}:
         return HashEmbeddingProvider(dimension=max(int(embedding_dimension), 1))
+
+    if normalized in {"local_bge", "bge_m3", "sentence_transformers", "local_st"}:
+        raise ValueError(
+            "local_bge/local_st providers are removed. Use openai_compatible or hash."
+        )
 
     if normalized in {"openai", "openai_compatible", "openai-compatible"}:
         api_key = (
