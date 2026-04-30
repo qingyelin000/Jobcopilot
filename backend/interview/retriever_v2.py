@@ -314,14 +314,15 @@ class RetrieverV2:
         query_kwargs = dict(common_kwargs)
         query_kwargs["query_filter"] = query_filter
 
-        # 兼容不同 qdrant-client 版本：优先 query_points，必要时降级到 search。
+        # build_qdrant_index.py creates the default unnamed vector; keep named
+        # fallback only for older collections that were created with "dense".
         if hasattr(self.client, "query_points"):
             try:
-                response = self.client.query_points(query=query_vector, using="dense", **query_kwargs)
+                response = self.client.query_points(query=query_vector, **query_kwargs)
                 hits = self._extract_points(response)
             except Exception:
                 try:
-                    response = self.client.query_points(query=query_vector, **query_kwargs)
+                    response = self.client.query_points(query=query_vector, using="dense", **query_kwargs)
                     hits = self._extract_points(response)
                 except Exception:
                     hits = []
@@ -330,14 +331,14 @@ class RetrieverV2:
             search_kwargs = dict(common_kwargs)
             search_kwargs["query_filter"] = query_filter
             try:
-                response = self.client.search(
-                    query_vector=models.NamedVector(name="dense", vector=query_vector),  # type: ignore[arg-type]
-                    **search_kwargs,
-                )
+                response = self.client.search(query_vector=query_vector, **search_kwargs)
                 hits = self._extract_points(response)
             except Exception:
                 try:
-                    response = self.client.search(query_vector=query_vector, **search_kwargs)
+                    response = self.client.search(
+                        query_vector=models.NamedVector(name="dense", vector=query_vector),  # type: ignore[arg-type]
+                        **search_kwargs,
+                    )
                     hits = self._extract_points(response)
                 except Exception:
                     hits = []
@@ -708,4 +709,4 @@ class RetrieverV2:
                 selected.append(item)
                 selected_ids.add(item.question.question_id)
 
-        return selected[: max(top_k, 1)]
+        return sorted(selected, key=lambda item: item.score, reverse=True)[: max(top_k, 1)]
