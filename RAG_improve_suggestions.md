@@ -33,8 +33,56 @@
 | 已完成 | 临时产物清理 | 已删除临时 Qdrant 集合 `rag_smoke_hash_test`，并移除本次 smoke 生成的临时 manifest/eval JSON 文件。 |
 | 已完成 | 银标指标评测 | 基于 3 个临时人工判断银标 case 测试 Hit@5、Recall@5、NDCG@5。扩展银标结果：Hit@5=1.0、Recall@5=0.473039、NDCG@5=0.584694；Redis case Recall@5=0.5/NDCG@5=0.55944，高并发系统设计 Recall@5=0.625/NDCG@5=0.86131，JVM+MySQL+线程池多意图 case Recall@5=0.294118/NDCG@5=0.333333。临时 eval JSONL 已清理。 |
 | 已完成 | 长上下文影响测试 | 构造同一 Redis/MySQL 一致性 query 的短上下文与 1418 字长上下文对照。短上下文：Hit@5=1.0、Precision@5=0.4、Recall@5=0.2、NDCG@5=0.360055、召回约 1467ms；长上下文：Hit@5=1.0、Precision@5=0.2、Recall@5=0.1、NDCG@5=0.16958、召回约 1535ms。长上下文把结果更多带向分布式锁/分布式事务/项目泛化题，验证原始 JD+简历全文会稀释精确召回。 |
+| 已完成 | 分层上下文第一版 | 已实现面试 RAG 检索短上下文：新增 `InterviewSession.retrieval_resume_text` / `retrieval_jd_text`，启动时从 `interview_profile_json` 构造短检索文本并落库，后续答题检索复用短上下文；`resume_text` / `jd_text` 原文仍保留给评估和出题 Agent。Docker MySQL 已通过 startup DDL 补列。合成 Redis/MySQL case 对照：raw_long Precision@5=0.2、Recall@5=0.1、NDCG@5=0.131205、约 1746ms；layered_profile Precision@5=0.4、Recall@5=0.2、NDCG@5=0.300785、约 1286ms。`python -m py_compile api.py models.py` 与 `pytest tests/test_auth_and_interview_api.py -q` 通过。 |
 
 ## 优化建议
+
+### P0-0：分层上下文，避免长 JD/简历稀释 RAG 召回
+
+**现状**
+
+用户上传简历和 JD 后，系统会保存三类内容：
+
+- `source_text`：PDF/JD 原文。
+- `parsed_json`：LLM 结构化解析结果。简历对应 `UserInfo`，JD 对应 `JDInfo`。
+- `interview_profile_json`：由代码从 `parsed_json` 压缩出的面试画像。简历侧包含 `top_skills`、`project_highlights`；JD 侧包含 `job_title`、`company_name`、`must_have_skills`、`nice_to_have_skills`、`core_responsibilities`、`business_domain`。
+
+但当前模拟面试 RAG 在 `backend\api.py` 中仍把 `resume_document.source_text` 和 `jd_document.source_text` 直接传给 `retriever.search()`。长上下文测试显示，同一 Redis/MySQL 一致性 query 下，约 1418 字上下文会把结果带向分布式锁、分布式事务和项目泛化题，Precision@5、Recall@5、NDCG@5 均低于短上下文。
+
+**目标**
+
+采用“分层上下文”：
+
+1. **Retriever/embedding/rerank 用短上下文**：优先从 `interview_profile_json` 拼 300-500 字检索文本，保证召回聚焦、快且稳定。
+2. **面试官 Agent 用适中上下文**：继续保留候选题、当前阶段、历史问答、面试画像和必要项目摘要，用于生成更贴近真实简历的追问。
+3. **原文作为兜底/详情来源**：不直接喂给 embedding；只有在画像缺失或出题需要更具体证据时再使用截断后的原文片段。
+
+**建议短 query 格式**
+
+```text
+显式查询: <query_text>
+目标岗位: <target_role>
+目标公司: <target_company>
+JD岗位: <job_title>
+JD领域: <business_domain>
+JD核心技能: <must_have_skills top 10>
+JD职责: <core_responsibilities top 5, 每条截断>
+简历技能: <top_skills top 10>
+简历项目: <project_name + tech_stack + summary，最多 3 个项目，每个 summary 截断到 80 字>
+```
+
+**实现位置**
+
+- 在 `backend\api.py` 新增 `_build_interview_retrieval_context(...)` 或同等 helper。
+- `start_interview_session`：读取 `resume_document.interview_profile_json` 与 `jd_document.interview_profile_json`，构造 `retrieval_resume_text`、`retrieval_jd_text` 后传给 `retriever.search()`。
+- `answer_interview_session`：建议在 `InterviewSession` 中保留原文，同时后续可以增加 `retrieval_resume_text` / `retrieval_jd_text` 缓存字段；第一版可在 session 创建时把短上下文写入 `query` 或在 `current_question_json` metadata 中保留。若不改 DB schema，则先在 session 中保留原文，下一轮检索暂用同一 helper 从已保存画像或 session metadata 取短文本。
+
+**验收**
+
+- 对长上下文 Redis/MySQL 一致性 case，Recall@5 和 NDCG@5 不低于当前短上下文 baseline。
+- 对 JVM+MySQL+线程池多意图 case，不因短 query 丢失显式 query 中的 JVM/线程池关键词。
+- HTTP `/api/v1/interview/sessions/start` 能正常生成第一题。
+- 现有 `tests/test_auth_and_interview_api.py` 通过。
 
 ### P0-1：避免异步接口阻塞 event loop
 

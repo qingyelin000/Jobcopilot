@@ -114,6 +114,24 @@ def _ensure_user_profile_columns() -> None:
             connection.execute(text(statement))
 
 
+def _ensure_interview_session_columns() -> None:
+    inspector = inspect(engine)
+    if "interview_sessions" not in inspector.get_table_names():
+        return
+
+    existing_columns = {column["name"] for column in inspector.get_columns("interview_sessions")}
+    alter_statements = {
+        "retrieval_resume_text": "ALTER TABLE interview_sessions ADD COLUMN retrieval_resume_text TEXT NULL",
+        "retrieval_jd_text": "ALTER TABLE interview_sessions ADD COLUMN retrieval_jd_text TEXT NULL",
+    }
+
+    with engine.begin() as connection:
+        for column_name, statement in alter_statements.items():
+            if column_name in existing_columns:
+                continue
+            connection.execute(text(statement))
+
+
 def _serialize_user_profile(user: User) -> UserProfileResponse:
     return UserProfileResponse(
         id=user.id,
@@ -132,6 +150,7 @@ def _serialize_user_profile(user: User) -> UserProfileResponse:
 def startup_event():
     Base.metadata.create_all(bind=engine)
     _ensure_user_profile_columns()
+    _ensure_interview_session_columns()
     _mark_interrupted_process_jobs()
     mark_interrupted_document_jobs()
 
@@ -408,6 +427,100 @@ def _compose_interview_query(
         if item and item not in query_parts:
             query_parts.append(item)
     return " ".join(query_parts)
+
+
+def _compact_retrieval_text(value: Any, limit: int) -> str:
+    text_value = " ".join(str(value or "").split())
+    if not text_value:
+        return ""
+    return text_value[: max(int(limit), 1)]
+
+
+def _limited_strings(values: Any, *, limit: int, item_limit: int = 48) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    items: list[str] = []
+    for value in values:
+        item = _compact_retrieval_text(value, item_limit)
+        if item and item not in items:
+            items.append(item)
+        if len(items) >= max(int(limit), 0):
+            break
+    return items
+
+
+def _build_resume_retrieval_text(document: ResumeDocument) -> str:
+    profile = document.interview_profile_json if isinstance(document.interview_profile_json, dict) else {}
+    parts: list[str] = []
+
+    skills = _limited_strings(profile.get("top_skills"), limit=10, item_limit=32)
+    if skills:
+        parts.append(f"resume_skills: {', '.join(skills)}")
+
+    projects = profile.get("project_highlights")
+    if isinstance(projects, list):
+        project_parts: list[str] = []
+        for project in projects[:3]:
+            if not isinstance(project, dict):
+                continue
+            name = _compact_retrieval_text(project.get("project_name"), 36)
+            tech_stack = _limited_strings(project.get("tech_stack"), limit=6, item_limit=28)
+            summary = _compact_retrieval_text(project.get("summary"), 80)
+            line_parts = []
+            if name:
+                line_parts.append(name)
+            if tech_stack:
+                line_parts.append(f"tech_stack: {', '.join(tech_stack)}")
+            if summary:
+                line_parts.append(summary)
+            if line_parts:
+                project_parts.append(" | ".join(line_parts))
+        if project_parts:
+            parts.append("resume_projects: " + "; ".join(project_parts))
+
+    if parts:
+        return "\n".join(parts)
+    return _compact_retrieval_text(document.source_text, 500)
+
+
+def _build_jd_retrieval_text(document: JDDocument) -> str:
+    profile = document.interview_profile_json if isinstance(document.interview_profile_json, dict) else {}
+    parts: list[str] = []
+
+    title = _compact_retrieval_text(profile.get("job_title"), 48)
+    company = _compact_retrieval_text(profile.get("company_name"), 48)
+    domain = _compact_retrieval_text(profile.get("business_domain"), 80)
+    heading_parts = []
+    if company:
+        heading_parts.append(f"company: {company}")
+    if title:
+        heading_parts.append(f"job_title: {title}")
+    if domain:
+        heading_parts.append(f"business_domain: {domain}")
+    if heading_parts:
+        parts.append("; ".join(heading_parts))
+
+    must_have = _limited_strings(profile.get("must_have_skills"), limit=10, item_limit=48)
+    if must_have:
+        parts.append(f"jd_must_have_skills: {', '.join(must_have)}")
+
+    responsibilities = _limited_strings(profile.get("core_responsibilities"), limit=5, item_limit=80)
+    if responsibilities:
+        parts.append("jd_responsibilities: " + "; ".join(responsibilities))
+
+    if parts:
+        return "\n".join(parts)
+    return _compact_retrieval_text(document.source_text, 500)
+
+
+def _build_interview_retrieval_context(
+    resume_document: ResumeDocument,
+    jd_document: JDDocument,
+) -> tuple[str, str]:
+    return (
+        _build_resume_retrieval_text(resume_document),
+        _build_jd_retrieval_text(jd_document),
+    )
 
 
 def _build_retriever() -> Any:
@@ -1674,6 +1787,10 @@ async def start_interview_session(
     )
     resume_text = str(resume_document.source_text or "")
     jd_text = str(jd_document.source_text or "")
+    retrieval_resume_text, retrieval_jd_text = _build_interview_retrieval_context(
+        resume_document,
+        jd_document,
+    )
     target_company, target_role = _resolve_session_targets(
         current_user=current_user,
         jd_document=jd_document,
@@ -1690,8 +1807,8 @@ async def start_interview_session(
     try:
         retriever = _get_retriever(backend)
         results = retriever.search(
-            resume_text=resume_text,
-            jd_text=jd_text,
+            resume_text=retrieval_resume_text,
+            jd_text=retrieval_jd_text,
             top_k=top_k,
             extra_query=query_text or None,
             target_company=target_company or None,
@@ -1725,6 +1842,8 @@ async def start_interview_session(
         query=query_text,
         resume_text=resume_text,
         jd_text=jd_text,
+        retrieval_resume_text=retrieval_resume_text,
+        retrieval_jd_text=retrieval_jd_text,
         target_company=target_company or None,
         target_role=target_role or None,
         current_question_json=first_question,
@@ -1884,8 +2003,8 @@ async def answer_interview_session(
     try:
         retriever = _get_retriever(str(session.backend or "v2"))
         next_results = retriever.search(
-            resume_text=str(session.resume_text or ""),
-            jd_text=str(session.jd_text or ""),
+            resume_text=str(session.retrieval_resume_text or session.resume_text or ""),
+            jd_text=str(session.retrieval_jd_text or session.jd_text or ""),
             top_k=int(session.top_k or 8),
             extra_query=str(session.query or "") or None,
             target_company=str(session.target_company or "") or None,

@@ -110,6 +110,8 @@ class InterviewSession(Base):
     query = Column(Text, nullable=True)
     resume_text = Column(Text, nullable=False)
     jd_text = Column(Text, nullable=False)
+    retrieval_resume_text = Column(Text, nullable=True)
+    retrieval_jd_text = Column(Text, nullable=True)
     target_company = Column(String(120), nullable=True)
     target_role = Column(String(120), nullable=True)
     current_question_json = Column(JSON, nullable=True)
