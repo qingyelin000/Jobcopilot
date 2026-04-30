@@ -7,6 +7,11 @@ from typing import Any, Iterable
 from openai import OpenAI
 
 from schemas import (
+    AtsCoverageReport,
+    AtsKeywordHit,
+    CandidateJobFit,
+    FactCheckFinding,
+    FactCheckReport,
     JDInfo,
     JDInterviewProfile,
     MappingQualityScore,
@@ -15,6 +20,7 @@ from schemas import (
     ResumeJDMapping,
     ResumeProjectHighlight,
     RewriteQualityScore,
+    UpskillItem,
     UserInfo,
 )
 
@@ -320,13 +326,17 @@ def call_mimo_structured(
 
 def parse_resume_to_json(resume_text: str, model: str | None = None) -> UserInfo:
     system_prompt = """
-你是简历结构化信息提取助手。请从原始中文简历文本中提取结构化数据。
+你是简历结构化信息提取助手。请从原始简历文本（中文或英文）中提取结构化数据。
 规则：
-1. 只保留输入文本中有证据的信息。
-2. 不要杜撰项目名称、指标、技术栈或职责。
-3. 技能项尽量标准化、简洁表达。
-4. 缺失字段按 schema 默认值返回（空字符串或空数组）。
-5. `projects` 优先提取有实质内容的项目经历。
+1. 只保留输入文本中有证据的信息，禁止杜撰项目名称、指标、技术栈或职责。
+2. 技能项尽量标准化、简洁表达。
+3. `projects` 优先提取有实质内容的项目经历；`work_experience` 提取正式工作/实习经历（与项目可重复）。
+4. `quantified_results` 必须是简历原文里出现过的数字/事实（不要新造）。
+5. `level` 根据工作年限推断：intern(<0.5)/campus(应届)/1-3y/3-5y/5-10y/10y+；不确定填 unknown。
+6. `track` 在 backend/frontend/mobile/fullstack/algorithm/data/devops/qa/product/design/operations/general 中选最贴切的。
+7. `expected_salary_kk` 如果简历写了 "25-40k"/"年薪 30-50W" 等，转换成 (min, max) 月薪 1k 单位；不确定为 null。
+8. `resume_language` 自动判断为 zh/en；混排时按主语言。
+9. 缺失字段按 schema 默认值返回（空字符串/空数组/null）。
 """
 
     user_prompt = f"原始简历文本：\n{resume_text}"
@@ -341,13 +351,19 @@ def parse_resume_to_json(resume_text: str, model: str | None = None) -> UserInfo
 
 def parse_jd_to_json(jd_text: str, model: str | None = None) -> JDInfo:
     system_prompt = """
-你是岗位 JD 结构化信息提取助手。请从原始中文 JD 文本中提取招聘要求。
+你是岗位 JD 结构化信息提取助手。请从原始 JD 文本（中文或英文）中提取招聘要求。
 规则：
-1. `must_have_skills` 只放硬性要求技能。
-2. 加分项放入 `nice_to_have_skills`。
-3. `core_responsibilities` 使用动作导向短语总结。
-4. 不要补充 JD 中未出现的信息。
-5. 缺失字段按 schema 默认值返回。
+1. `must_have_skills` 只放硬性要求技能；加分项放入 `nice_to_have_skills`。
+2. `core_responsibilities` 使用动作导向短语总结。
+3. 不要补充 JD 中未出现的信息。
+4. `salary_range_kk` 解析"25-40k"/"年薪 30-50W"为 (min,max) 月薪 1k 单位；不确定为 null。
+5. `years_min` / `years_max` 解析"3-5年经验"为 (3,5)；"5年以上"则 years_min=5、years_max=null。
+6. `education_min` 保留原文（"本科及以上"等）。
+7. `industry` 优先 互联网/金融/外企/国企/教育/医疗/游戏/电商/咨询/制造 之一，无法判断填空。
+8. `style_profile` 推荐文风："互联网激进量化"/"外企正式严谨"/"国企稳重"/"咨询结构化"/"创业精炼"等短语。
+9. `track` 同候选人 schema 的枚举。
+10. `jd_language` 自动判断为 zh/en。
+11. 缺失字段按 schema 默认值返回。
 """
 
     user_prompt = f"原始 JD 文本：\n{jd_text}"
@@ -1424,15 +1440,44 @@ def evaluator_agent_evaluate_answer(
     max_rounds: int,
     target_company: str = "",
     target_role: str = "",
+    expected_points: list[str] | None = None,
+    bad_signals: list[str] | None = None,
+    question_type: str | None = None,
+    track: str | None = None,
     model: str | None = None,
 ) -> dict[str, Any]:
-    system_prompt = (
-        "You are an interview evaluator. Score this answer by accuracy, depth, structure, and resume fit, "
-        "then provide concise feedback and the next-step decision. Output JSON only."
+    is_coding = (question_type or "").lower() == "coding"
+    is_bq = (question_type or "").lower() in {"bq", "behavioral"}
+    track_hint = f"(候选人方向：{track})" if track else ""
+    rubric_intro = (
+        "你是一名严格的面试评估官。请按 Rubric 评分：必须先逐条命中点判定，再给出维度分数。"
+        f"{track_hint} 输出 JSON only，不要解释。"
     )
+    if is_coding:
+        rubric_intro += " 这是 Coding 题：必须额外评估 time_complexity / space_complexity / edge_cases。"
+    if is_bq:
+        rubric_intro += " 这是 BQ 题：必须额外评估 STAR 完整度（Situation/Task/Action/Result）。"
+
+    expected_points = list(expected_points or [])
+    bad_signals = list(bad_signals or [])
+
     response_schema = {
         "type": "object",
         "properties": {
+            "rubric_hits": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "point": {"type": "string"},
+                        "must_hit": {"type": "boolean"},
+                        "status": {"type": "string", "enum": ["hit", "partial", "miss"]},
+                        "evidence_quote": {"type": "string"},
+                    },
+                    "required": ["point", "status"],
+                },
+            },
+            "bad_signals_triggered": {"type": "array", "items": {"type": "string"}},
             "scores": {
                 "type": "object",
                 "properties": {
@@ -1440,6 +1485,12 @@ def evaluator_agent_evaluate_answer(
                     "depth": {"type": "number"},
                     "structure": {"type": "number"},
                     "resume_fit": {"type": "number"},
+                    "communication": {"type": "number"},
+                    "honesty": {"type": "number"},
+                    "problem_solving_process": {"type": "number"},
+                    "edge_case_awareness": {"type": "number"},
+                    "time_complexity": {"type": "number"},
+                    "star_completeness": {"type": "number"},
                     "overall": {"type": "number"},
                 },
                 "required": ["accuracy", "depth", "structure", "resume_fit", "overall"],
@@ -1452,8 +1503,21 @@ def evaluator_agent_evaluate_answer(
         },
         "required": ["scores", "strengths", "improvements", "feedback", "decision", "follow_up_hint"],
     }
+
+    code_review_payload = None
+    if is_coding:
+        try:
+            from business_extensions import static_code_review
+
+            code_review_payload = static_code_review(answer_text)
+        except Exception:
+            code_review_payload = None
+
     payload = {
         "question_text": question_text,
+        "question_type": question_type,
+        "expected_points": expected_points,
+        "bad_signals": bad_signals,
         "answer_text": answer_text,
         "resume_text": resume_text,
         "jd_text": jd_text,
@@ -1461,16 +1525,18 @@ def evaluator_agent_evaluate_answer(
         "max_rounds": max_rounds,
         "target_company": target_company,
         "target_role": target_role,
+        "track": track,
+        "static_code_review": code_review_payload,
     }
-    user_prompt = f"Evaluate this answer and return JSON:\n{json.dumps(payload, ensure_ascii=False)}"
+    user_prompt = f"按 Rubric 给出评估 JSON：\n{json.dumps(payload, ensure_ascii=False)}"
     raw = call_mimo_structured(
-        system_prompt,
+        rubric_intro,
         user_prompt,
         response_schema,
         model=_resolve_model_alias(model) or _mimo_evaluator_model(),
         temperature=0.2,
         top_p=0.9,
-        max_completion_tokens=1400,
+        max_completion_tokens=1800,
     )
     scores_payload = raw.get("scores") or {}
     scores = {
@@ -1478,19 +1544,29 @@ def evaluator_agent_evaluate_answer(
         "depth": _clamp_numeric_score(scores_payload.get("depth")),
         "structure": _clamp_numeric_score(scores_payload.get("structure")),
         "resume_fit": _clamp_numeric_score(scores_payload.get("resume_fit")),
+        "communication": _clamp_numeric_score(scores_payload.get("communication")),
+        "honesty": _clamp_numeric_score(scores_payload.get("honesty")),
+        "problem_solving_process": _clamp_numeric_score(scores_payload.get("problem_solving_process")),
+        "edge_case_awareness": _clamp_numeric_score(scores_payload.get("edge_case_awareness")),
+        "time_complexity": _clamp_numeric_score(scores_payload.get("time_complexity")) if is_coding else None,
+        "star_completeness": _clamp_numeric_score(scores_payload.get("star_completeness")) if is_bq else None,
         "overall": _clamp_numeric_score(scores_payload.get("overall")),
     }
     decision = str(raw.get("decision") or "next_question").strip().lower()
     if decision not in {"follow_up", "next_question", "finish"}:
         decision = "next_question"
     return {
-        "scores": scores,
+        "scores": {k: v for k, v in scores.items() if v is not None},
+        "rubric_hits": raw.get("rubric_hits") or [],
+        "bad_signals_triggered": raw.get("bad_signals_triggered") or [],
         "strengths": [str(item).strip() for item in (raw.get("strengths") or []) if str(item).strip()][:5],
         "improvements": [str(item).strip() for item in (raw.get("improvements") or []) if str(item).strip()][:5],
         "feedback": str(raw.get("feedback") or "").strip(),
         "decision": decision,
         "follow_up_hint": str(raw.get("follow_up_hint") or "").strip(),
+        "static_code_review": code_review_payload,
     }
+
 
 
 def evaluator_agent_build_summary(
@@ -1550,5 +1626,20 @@ def evaluator_agent_build_summary(
         "strengths": [str(item).strip() for item in (raw.get("strengths") or []) if str(item).strip()][:8],
         "improvements": [str(item).strip() for item in (raw.get("improvements") or []) if str(item).strip()][:8],
         "summary": str(raw.get("summary") or "").strip(),
+        "next_actions": _derive_next_actions_safe(
+            (raw.get("improvements") or []),
+        ),
     }
+
+
+def _derive_next_actions_safe(improvements):
+    try:
+        from business_extensions import derive_next_actions
+
+        return derive_next_actions([str(x) for x in improvements])
+    except Exception:
+        return []
+
+
+# === Batch A/B/C 业务能力扩展 ===
 

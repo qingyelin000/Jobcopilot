@@ -26,6 +26,14 @@ services:
     volumes:
       - qdrant_data:/qdrant/storage
 
+  redis:
+    image: redis:7-alpine
+    container_name: jobcopilot_redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+
   backend:
     build:
       context: ./backend
@@ -64,10 +72,20 @@ services:
       RERANK_API_KEY: ${RERANK_API_KEY:-}
       RERANK_TIMEOUT_SECONDS: ${RERANK_TIMEOUT_SECONDS:-15}
       RERANK_CANDIDATE_POOL: ${RERANK_CANDIDATE_POOL:-40}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      ENABLE_RATE_LIMIT: ${ENABLE_RATE_LIMIT:-true}
+      RATE_LIMIT_WINDOW_SECONDS: ${RATE_LIMIT_WINDOW_SECONDS:-60}
+      CHAT_RATE_LIMIT_USER_PER_WINDOW: ${CHAT_RATE_LIMIT_USER_PER_WINDOW:-20}
+      CHAT_RATE_LIMIT_IP_PER_WINDOW: ${CHAT_RATE_LIMIT_IP_PER_WINDOW:-60}
+      PROCESS_START_RATE_LIMIT_USER_PER_WINDOW: ${PROCESS_START_RATE_LIMIT_USER_PER_WINDOW:-3}
+      PROCESS_START_RATE_LIMIT_IP_PER_WINDOW: ${PROCESS_START_RATE_LIMIT_IP_PER_WINDOW:-8}
+      INTERVIEW_ANSWER_RATE_LIMIT_USER_PER_WINDOW: ${INTERVIEW_ANSWER_RATE_LIMIT_USER_PER_WINDOW:-30}
     depends_on:
       mysql:
         condition: service_healthy
       qdrant:
+        condition: service_started
+      redis:
         condition: service_started
 
   frontend:
@@ -89,3 +107,4 @@ services:
 volumes:
   mysql_data:
   qdrant_data:
+  redis_data:

@@ -3,12 +3,14 @@ from datetime import datetime
 import hashlib
 from io import BytesIO
 from threading import Lock
+import time
 from typing import Any
 import uuid
-from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import agents
+import business_extensions
 import os
 import json
 from document_assets import mark_interrupted_document_jobs, router as document_router
@@ -17,6 +19,11 @@ from sqlalchemy.orm import Session
 from PyPDF2 import PdfReader
 
 from langchain_openai import ChatOpenAI
+try:
+    from redis.asyncio import Redis
+except Exception:  # pragma: no cover - optional dependency in some local test runs.
+    Redis = None
+
 from auth import create_access_token, decode_access_token, get_password_hash, verify_password
 from auth_schemas import (
     LoginRequest,
@@ -32,11 +39,19 @@ from db import Base, SessionLocal, engine, get_db
 from interview.embedding_utils import default_embedding_provider_name
 from interview.retriever_v2 import DEFAULT_DATASET_PATH, serialize_retrieved_question
 from models import (
+    AnalyticsEvent,
+    ApplicationRecord,
+    ApplicationTimeline,
+    AuditLog,
+    ChatMessage,
+    ChatSession,
+    FeedbackEntry,
     JDDocument,
     InterviewSession,
     InterviewTurn,
     ResumeDocument,
     ResumeProcessJob,
+    UsageEvent,
     User,
 )
 from schemas import JDInfo, UserInfo
@@ -68,6 +83,12 @@ app.add_middleware(
 )
 app.include_router(document_router)
 
+_RATE_LIMIT_REDIS_CLIENT: Any | None = None
+_RATE_LIMIT_REDIS_LOCK = asyncio.Lock()
+_RATE_LIMIT_REDIS_BACKOFF_UNTIL = 0.0
+_LOCAL_RATE_LIMIT_COUNTER: dict[str, tuple[int, float]] = {}
+_LOCAL_RATE_LIMIT_LOCK = asyncio.Lock()
+
 
 def _ensure_user_profile_columns() -> None:
     inspector = inspect(engine)
@@ -82,6 +103,8 @@ def _ensure_user_profile_columns() -> None:
         "city": "ALTER TABLE users ADD COLUMN city VARCHAR(80) NULL",
         "target_role": "ALTER TABLE users ADD COLUMN target_role VARCHAR(120) NULL",
         "profile_summary": "ALTER TABLE users ADD COLUMN profile_summary TEXT NULL",
+        "plan": "ALTER TABLE users ADD COLUMN plan VARCHAR(20) NULL DEFAULT 'free'",
+        "llm_processing_consent_at": "ALTER TABLE users ADD COLUMN llm_processing_consent_at DATETIME NULL",
     }
 
     with engine.begin() as connection:
@@ -111,6 +134,11 @@ def startup_event():
     _ensure_user_profile_columns()
     _mark_interrupted_process_jobs()
     mark_interrupted_document_jobs()
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    await _reset_rate_limit_redis_client(backoff_seconds=0.0)
 
 class ProcessRequest(BaseModel):
     resume_text: str
@@ -145,6 +173,8 @@ class ParsePdfResponse(BaseModel):
     text: str
 
 class ChatRequest(BaseModel):
+    message: str
+    session_id: str | None = None
     message: str
 
 
@@ -242,6 +272,60 @@ def _safe_float_from_env(name: str, default: float, minimum: float | None = None
 
 INTERVIEW_TOP_K = min(_safe_int_from_env("INTERVIEW_TOP_K", 20, minimum=1), 20)
 INTERVIEW_MAX_ROUNDS = _safe_int_from_env("INTERVIEW_MAX_ROUNDS", 0, minimum=0)
+RATE_LIMIT_ENABLED = _feature_enabled("ENABLE_RATE_LIMIT", True)
+RATE_LIMIT_WINDOW_SECONDS = _safe_int_from_env("RATE_LIMIT_WINDOW_SECONDS", 60, minimum=1)
+RATE_LIMIT_USE_REDIS = _feature_enabled("RATE_LIMIT_USE_REDIS", True)
+RATE_LIMIT_FALLBACK_LOCAL = _feature_enabled("RATE_LIMIT_FALLBACK_LOCAL", True)
+RATE_LIMIT_REDIS_URL = (
+    os.getenv("RATE_LIMIT_REDIS_URL", "").strip()
+    or os.getenv("REDIS_URL", "").strip()
+)
+RATE_LIMIT_REDIS_CONNECT_TIMEOUT_SECONDS = _safe_float_from_env(
+    "RATE_LIMIT_REDIS_CONNECT_TIMEOUT_SECONDS",
+    0.2,
+    minimum=0.05,
+)
+RATE_LIMIT_REDIS_SOCKET_TIMEOUT_SECONDS = _safe_float_from_env(
+    "RATE_LIMIT_REDIS_SOCKET_TIMEOUT_SECONDS",
+    0.2,
+    minimum=0.05,
+)
+RATE_LIMIT_REDIS_BACKOFF_SECONDS = _safe_float_from_env(
+    "RATE_LIMIT_REDIS_BACKOFF_SECONDS",
+    30.0,
+    minimum=1.0,
+)
+LOCAL_RATE_LIMIT_MAX_KEYS = _safe_int_from_env("LOCAL_RATE_LIMIT_MAX_KEYS", 10000, minimum=500)
+CHAT_RATE_LIMIT_USER_PER_WINDOW = _safe_int_from_env(
+    "CHAT_RATE_LIMIT_USER_PER_WINDOW",
+    20,
+    minimum=0,
+)
+CHAT_RATE_LIMIT_IP_PER_WINDOW = _safe_int_from_env(
+    "CHAT_RATE_LIMIT_IP_PER_WINDOW",
+    60,
+    minimum=0,
+)
+PROCESS_START_RATE_LIMIT_USER_PER_WINDOW = _safe_int_from_env(
+    "PROCESS_START_RATE_LIMIT_USER_PER_WINDOW",
+    3,
+    minimum=0,
+)
+PROCESS_START_RATE_LIMIT_IP_PER_WINDOW = _safe_int_from_env(
+    "PROCESS_START_RATE_LIMIT_IP_PER_WINDOW",
+    8,
+    minimum=0,
+)
+INTERVIEW_ANSWER_RATE_LIMIT_USER_PER_WINDOW = _safe_int_from_env(
+    "INTERVIEW_ANSWER_RATE_LIMIT_USER_PER_WINDOW",
+    30,
+    minimum=0,
+)
+INTERVIEW_ANSWER_RATE_LIMIT_IP_PER_WINDOW = _safe_int_from_env(
+    "INTERVIEW_ANSWER_RATE_LIMIT_IP_PER_WINDOW",
+    0,
+    minimum=0,
+)
 
 
 def _normalize_retriever_backend(value: str | None) -> str:
@@ -635,16 +719,243 @@ def get_current_user(
         raise HTTPException(status_code=401, detail="未登录或登录已过期")
     return current_user
 
-def _extract_text_from_pdf_bytes(file_bytes: bytes) -> tuple[str, int]:
-    reader = PdfReader(BytesIO(file_bytes))
-    pages: list[str] = []
 
+def _extract_client_ip(request: Request) -> str:
+    forwarded_for = str(request.headers.get("x-forwarded-for") or "").strip()
+    if forwarded_for:
+        first_hop = forwarded_for.split(",")[0].strip()
+        if first_hop:
+            return first_hop
+
+    real_ip = str(request.headers.get("x-real-ip") or "").strip()
+    if real_ip:
+        return real_ip
+
+    if request.client and request.client.host:
+        return str(request.client.host).strip() or "unknown"
+    return "unknown"
+
+
+def _resolve_rate_limit_subject(current_user: User | None, request: Request) -> tuple[str, str]:
+    if current_user is not None:
+        return "user", str(current_user.id)
+    return "ip", _extract_client_ip(request)
+
+
+def _build_rate_limit_key(
+    *,
+    route_name: str,
+    subject_type: str,
+    subject_id: str,
+    window_seconds: int,
+) -> tuple[str, float]:
+    safe_window = max(int(window_seconds), 1)
+    bucket = int(time.time() // safe_window)
+    expires_at = float((bucket + 1) * safe_window + 1)
+    key = f"rl:{route_name}:{subject_type}:{subject_id}:{bucket}"
+    return key, expires_at
+
+
+async def _close_async_resource(resource: Any) -> None:
+    close_method = getattr(resource, "aclose", None) or getattr(resource, "close", None)
+    if not callable(close_method):
+        return
+    result = close_method()
+    if asyncio.iscoroutine(result):
+        await result
+
+
+async def _reset_rate_limit_redis_client(*, backoff_seconds: float | None = None) -> None:
+    global _RATE_LIMIT_REDIS_CLIENT
+    global _RATE_LIMIT_REDIS_BACKOFF_UNTIL
+
+    client = _RATE_LIMIT_REDIS_CLIENT
+    _RATE_LIMIT_REDIS_CLIENT = None
+    if backoff_seconds is None:
+        _RATE_LIMIT_REDIS_BACKOFF_UNTIL = time.monotonic() + float(RATE_LIMIT_REDIS_BACKOFF_SECONDS)
+    else:
+        _RATE_LIMIT_REDIS_BACKOFF_UNTIL = time.monotonic() + max(float(backoff_seconds), 0.0)
+
+    if client is None:
+        return
+    try:
+        await _close_async_resource(client)
+    except Exception:
+        # Limiters should fail open; do not propagate infra cleanup issues.
+        pass
+
+
+def _build_rate_limit_redis_client() -> Any | None:
+    if not RATE_LIMIT_USE_REDIS:
+        return None
+    if Redis is None:
+        return None
+    if not RATE_LIMIT_REDIS_URL:
+        return None
+
+    return Redis.from_url(
+        RATE_LIMIT_REDIS_URL,
+        encoding="utf-8",
+        decode_responses=True,
+        socket_connect_timeout=float(RATE_LIMIT_REDIS_CONNECT_TIMEOUT_SECONDS),
+        socket_timeout=float(RATE_LIMIT_REDIS_SOCKET_TIMEOUT_SECONDS),
+        retry_on_timeout=True,
+    )
+
+
+async def _get_rate_limit_redis_client() -> Any | None:
+    global _RATE_LIMIT_REDIS_CLIENT
+
+    if not RATE_LIMIT_USE_REDIS:
+        return None
+    if time.monotonic() < _RATE_LIMIT_REDIS_BACKOFF_UNTIL:
+        return None
+    if _RATE_LIMIT_REDIS_CLIENT is not None:
+        return _RATE_LIMIT_REDIS_CLIENT
+
+    async with _RATE_LIMIT_REDIS_LOCK:
+        if _RATE_LIMIT_REDIS_CLIENT is not None:
+            return _RATE_LIMIT_REDIS_CLIENT
+        _RATE_LIMIT_REDIS_CLIENT = _build_rate_limit_redis_client()
+        return _RATE_LIMIT_REDIS_CLIENT
+
+
+async def _incr_redis_rate_limit_counter(*, key: str, window_seconds: int) -> tuple[int, int] | None:
+    client = await _get_rate_limit_redis_client()
+    if client is None:
+        return None
+
+    try:
+        count = int(await client.incr(key))
+        if count == 1:
+            await client.expire(key, int(window_seconds) + 1)
+        ttl_raw = int(await client.ttl(key))
+        ttl = ttl_raw if ttl_raw > 0 else int(window_seconds)
+        return count, ttl
+    except Exception:
+        await _reset_rate_limit_redis_client()
+        return None
+
+
+async def _incr_local_rate_limit_counter(*, key: str, expires_at: float, window_seconds: int) -> tuple[int, int]:
+    now = time.time()
+    async with _LOCAL_RATE_LIMIT_LOCK:
+        count, existing_expires_at = _LOCAL_RATE_LIMIT_COUNTER.get(key, (0, expires_at))
+        if existing_expires_at <= now:
+            count = 0
+            existing_expires_at = expires_at
+
+        count = int(count) + 1
+        _LOCAL_RATE_LIMIT_COUNTER[key] = (count, existing_expires_at)
+
+        if len(_LOCAL_RATE_LIMIT_COUNTER) > int(LOCAL_RATE_LIMIT_MAX_KEYS):
+            expired_keys = [
+                item_key
+                for item_key, (_, item_expires_at) in _LOCAL_RATE_LIMIT_COUNTER.items()
+                if item_expires_at <= now
+            ]
+            for item_key in expired_keys:
+                _LOCAL_RATE_LIMIT_COUNTER.pop(item_key, None)
+
+        ttl = max(1, int(existing_expires_at - now))
+        return count, ttl or int(window_seconds)
+
+
+async def _incr_rate_limit_counter(*, key: str, expires_at: float, window_seconds: int) -> tuple[int, int]:
+    redis_result = await _incr_redis_rate_limit_counter(key=key, window_seconds=window_seconds)
+    if redis_result is not None:
+        return redis_result
+
+    if RATE_LIMIT_FALLBACK_LOCAL:
+        return await _incr_local_rate_limit_counter(
+            key=key,
+            expires_at=expires_at,
+            window_seconds=window_seconds,
+        )
+
+    # Fail open when both Redis and local fallback are unavailable.
+    return 0, max(int(window_seconds), 1)
+
+
+async def _enforce_rate_limit(
+    *,
+    route_name: str,
+    request: Request,
+    current_user: User | None,
+    user_limit: int,
+    ip_limit: int,
+) -> None:
+    if not RATE_LIMIT_ENABLED:
+        return
+
+    subject_type, subject_id = _resolve_rate_limit_subject(current_user, request)
+    limit = int(user_limit) if subject_type == "user" else int(ip_limit)
+    if limit <= 0:
+        return
+
+    key, expires_at = _build_rate_limit_key(
+        route_name=route_name,
+        subject_type=subject_type,
+        subject_id=subject_id,
+        window_seconds=RATE_LIMIT_WINDOW_SECONDS,
+    )
+    count, ttl = await _incr_rate_limit_counter(
+        key=key,
+        expires_at=expires_at,
+        window_seconds=RATE_LIMIT_WINDOW_SECONDS,
+    )
+    if count <= limit:
+        return
+
+    retry_after = max(int(ttl), 1)
+    raise HTTPException(
+        status_code=429,
+        detail=f"请求过于频繁，请在 {retry_after} 秒后重试。",
+        headers={"Retry-After": str(retry_after)},
+    )
+
+
+def _extract_text_from_pdf_bytes(file_bytes: bytes) -> tuple[str, int]:
+    """优先用 pdfplumber（保留排版/表格更稳），失败回退 PyPDF2。"""
+
+    try:  # pragma: no cover - optional dependency
+        import pdfplumber  # type: ignore
+
+        with pdfplumber.open(BytesIO(file_bytes)) as pdf:
+            pages: list[str] = []
+            for page in pdf.pages:
+                txt = (page.extract_text() or "").strip()
+                if txt:
+                    pages.append(txt)
+            if pages:
+                return "\n\n".join(pages).strip(), len(pdf.pages)
+    except Exception:
+        pass
+
+    reader = PdfReader(BytesIO(file_bytes))
+    pages_legacy: list[str] = []
     for page in reader.pages:
         page_text = (page.extract_text() or "").strip()
         if page_text:
-            pages.append(page_text)
+            pages_legacy.append(page_text)
+    return "\n\n".join(pages_legacy).strip(), len(reader.pages)
 
-    return "\n\n".join(pages).strip(), len(reader.pages)
+
+def _extract_text_from_docx_bytes(file_bytes: bytes) -> tuple[str, int]:
+    """解析 docx：返回 (text, paragraph_count)。OCR 兜底未启用，仅 TODO。"""
+
+    try:  # pragma: no cover
+        import docx  # type: ignore
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"python-docx 未安装: {exc}")
+    document = docx.Document(BytesIO(file_bytes))
+    paragraphs = [p.text.strip() for p in document.paragraphs if p.text and p.text.strip()]
+    for tbl in document.tables:
+        for row in tbl.rows:
+            for cell in row.cells:
+                if cell.text and cell.text.strip():
+                    paragraphs.append(cell.text.strip())
+    return "\n".join(paragraphs).strip(), len(paragraphs)
 
 
 def _build_process_cache_key(resume_text: str, jd_text: str) -> str:
@@ -1095,6 +1406,26 @@ async def _build_process_payload(
         optimized_resume,
     )
 
+    # Batch B: ATS keyword coverage（确定性，不依赖 LLM）
+    ats_coverage = business_extensions.compute_ats_coverage(user_info, jd_info, optimized_resume)
+    try:
+        match_mapping.ats_coverage = ats_coverage
+    except Exception:
+        pass
+
+    # Batch B: 重写后强制做事实一致性校验
+    fact_check = await asyncio.to_thread(
+        business_extensions.factcheck_rewrite, optimized_resume, user_info
+    )
+
+    # Batch A: candidate-job fit（含 LLM + 确定性回退）
+    fit_report = await asyncio.to_thread(
+        business_extensions.compute_candidate_job_fit, user_info, jd_info
+    )
+
+    # Batch B: 渲染完整简历 markdown
+    rendered_markdown = business_extensions.render_resume_markdown(user_info, optimized_resume)
+
     if job_id is not None:
         _update_process_job(
             job_id,
@@ -1116,6 +1447,10 @@ async def _build_process_payload(
             "optimized_resume": optimized_resume.model_dump(),
             "mapping_quality": mapping_quality,
             "rewrite_quality": rewrite_quality,
+            "ats_coverage": ats_coverage.model_dump(),
+            "fact_check": fact_check.model_dump(),
+            "candidate_job_fit": fit_report.model_dump(),
+            "rendered_resume_markdown": rendered_markdown,
         },
     }
 
@@ -1252,6 +1587,30 @@ async def parse_resume_pdf(file: UploadFile = File(...)):
         raise
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"PDF 解析失败: {exc}") from exc
+
+
+@app.post("/api/v1/resume/parse-docx", response_model=ParsePdfResponse)
+async def parse_resume_docx(file: UploadFile = File(...)):
+    filename = (file.filename or "").strip()
+    if not filename.lower().endswith(".docx"):
+        raise HTTPException(status_code=400, detail="请上传 .docx 文件（不支持旧版 .doc）")
+    try:
+        file_bytes = await file.read()
+        if not file_bytes:
+            raise HTTPException(status_code=400, detail="上传的 docx 为空")
+        text, paragraph_count = await asyncio.to_thread(_extract_text_from_docx_bytes, file_bytes)
+        if not text:
+            raise HTTPException(status_code=400, detail="docx 中没有可提取的文本（OCR 兜底未启用）")
+        return ParsePdfResponse(
+            filename=filename,
+            page_count=paragraph_count,
+            char_count=len(text),
+            text=text,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"docx 解析失败: {exc}") from exc
 
 @app.post("/api/v1/interview/retrieve", response_model=InterviewRetrieveResponse)
 async def retrieve_interview_questions(req: InterviewRetrieveRequest):
@@ -1396,9 +1755,18 @@ async def start_interview_session(
 async def answer_interview_session(
     session_id: str,
     req: InterviewAnswerRequest,
+    request: Request,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    await _enforce_rate_limit(
+        route_name="interview_answer",
+        request=request,
+        current_user=current_user,
+        user_limit=INTERVIEW_ANSWER_RATE_LIMIT_USER_PER_WINDOW,
+        ip_limit=INTERVIEW_ANSWER_RATE_LIMIT_IP_PER_WINDOW,
+    )
+
     query = (
         db.query(InterviewSession)
         .filter(
@@ -1446,6 +1814,7 @@ async def answer_interview_session(
     turn.answer_text = answer_text
 
     try:
+        question_meta = turn.question_json if isinstance(turn.question_json, dict) else {}
         evaluation = agents.evaluator_agent_evaluate_answer(
             question_text=current_question_text,
             answer_text=answer_text,
@@ -1455,6 +1824,10 @@ async def answer_interview_session(
             max_rounds=int(session.max_rounds),
             target_company=str(session.target_company or ""),
             target_role=str(session.target_role or ""),
+            expected_points=question_meta.get("expected_points") or [],
+            bad_signals=question_meta.get("bad_signals") or [],
+            question_type=question_meta.get("question_type"),
+            track=question_meta.get("track"),
         )
     except Exception:
         evaluation = {
@@ -1677,8 +2050,17 @@ async def process_job_application(
 @app.post("/api/v1/process/start", response_model=ProcessJobResponse)
 async def start_process_job(
     req: ProcessRequest,
+    request: Request,
     current_user: User | None = Depends(get_current_user_optional),
 ):
+    await _enforce_rate_limit(
+        route_name="process_start",
+        request=request,
+        current_user=current_user,
+        user_limit=PROCESS_START_RATE_LIMIT_USER_PER_WINDOW,
+        ip_limit=PROCESS_START_RATE_LIMIT_IP_PER_WINDOW,
+    )
+
     cache_key = _build_process_cache_key(req.resume_text, req.jd_text)
     user_id = current_user.id if current_user else None
 
@@ -1760,9 +2142,43 @@ async def delete_process_job(
 
 
 @app.post("/api/v1/chat")
-async def chat_with_agent(req: ChatRequest):
+async def chat_with_agent(
+    req: ChatRequest,
+    request: Request,
+    current_user: User | None = Depends(get_current_user_optional),
+    db: Session = Depends(get_db),
+):
     if not _feature_enabled("ENABLE_CHAT", True):
         raise HTTPException(status_code=404, detail="Chat feature is disabled")
+
+    await _enforce_rate_limit(
+        route_name="chat",
+        request=request,
+        current_user=current_user,
+        user_limit=CHAT_RATE_LIMIT_USER_PER_WINDOW,
+        ip_limit=CHAT_RATE_LIMIT_IP_PER_WINDOW,
+    )
+
+    history_messages: list[dict[str, str]] = []
+    session_record = None
+    if req.session_id:
+        session_record = db.query(ChatSession).filter(ChatSession.id == req.session_id).first()
+        if session_record:
+            past = (
+                db.query(ChatMessage)
+                .filter(ChatMessage.session_id == req.session_id)
+                .order_by(ChatMessage.id.asc())
+                .limit(20)
+                .all()
+            )
+            history_messages = [{"role": m.role, "content": m.content} for m in past]
+
+    profile_hint = ""
+    if current_user is not None:
+        profile_hint = (
+            f"用户画像：目标岗位={current_user.target_role or '未填'}，"
+            f"城市={current_user.city or '未填'}。"
+        )
 
     try:
         llm = ChatOpenAI(
@@ -1771,15 +2187,425 @@ async def chat_with_agent(req: ChatRequest):
             model="deepseek-chat",
             temperature=0.2,
         )
-        prompt = (
+        system_prompt = (
             "You are JobCopilot, a practical career assistant. "
             "Give concise, actionable, and honest guidance in Chinese.\n"
-            f"User message: {req.message}"
+            "可调用工具（伪 function 列表，真实调用待落地）：\n"
+            "- read_my_resume() 查看用户最新简历摘要\n"
+            "- start_mock_interview(target_role, level) 触发模拟面试\n"
+            "- pull_recent_feedback() 拉取最近反馈\n"
+            "- draft_followup_email(company, role) 起草跟进邮件\n"
+            f"{profile_hint}"
         )
+        history_text = "\n".join(f"{m['role']}: {m['content']}" for m in history_messages[-10:])
+        prompt = f"{system_prompt}\n\n历史对话:\n{history_text}\n\nuser: {req.message}\nassistant:"
         reply = await llm.ainvoke(prompt)
-        return {"reply": (reply.content or "").strip()}
+        reply_content = (reply.content or "").strip()
+        if session_record is not None:
+            db.add(ChatMessage(session_id=session_record.id, role="user", content=req.message))
+            db.add(ChatMessage(session_id=session_record.id, role="assistant", content=reply_content))
+            db.commit()
+        return {"reply": reply_content, "session_id": req.session_id}
     except Exception as exc:
         import traceback
 
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+# === Batch B/C/E/F/G/H/I/J 业务路由扩展 ===
+
+import pii_utils
+from datetime import datetime as _dt
+
+
+class FitRequest(BaseModel):
+    resume_text: str | None = None
+    jd_text: str | None = None
+    user_info: dict | None = None
+    jd_info: dict | None = None
+
+
+@app.post("/api/v1/fit")
+async def candidate_job_fit(
+    req: FitRequest,
+    current_user: User | None = Depends(get_current_user_optional),
+):
+    if req.user_info:
+        user_info = UserInfo.model_validate(req.user_info)
+    elif req.resume_text:
+        user_info = await asyncio.to_thread(agents.parse_resume_to_json, req.resume_text)
+    else:
+        raise HTTPException(status_code=400, detail="resume_text or user_info required")
+    if req.jd_info:
+        jd_info = JDInfo.model_validate(req.jd_info)
+    elif req.jd_text:
+        jd_info = await asyncio.to_thread(agents.parse_jd_to_json, req.jd_text)
+    else:
+        raise HTTPException(status_code=400, detail="jd_text or jd_info required")
+    fit = await asyncio.to_thread(business_extensions.compute_candidate_job_fit, user_info, jd_info)
+    coverage = business_extensions.compute_ats_coverage(user_info, jd_info)
+    return {"fit": fit.model_dump(), "ats_coverage": coverage.model_dump()}
+
+
+class RenderResumeRequest(BaseModel):
+    user_info: dict
+    optimized_resume: dict | None = None
+
+
+@app.post("/api/v1/resumes/render")
+def render_resume(req: RenderResumeRequest):
+    from schemas import OptimizedResume
+
+    user_info = UserInfo.model_validate(req.user_info)
+    optimized = OptimizedResume.model_validate(req.optimized_resume) if req.optimized_resume else None
+    md = business_extensions.render_resume_markdown(user_info, optimized)
+    return {"format": "markdown", "content": md}
+
+
+# ---------- Applications (Batch E) ----------
+
+
+class ApplicationCreate(BaseModel):
+    company: str
+    role: str
+    jd_document_id: int | None = None
+    resume_document_id: int | None = None
+    process_job_id: str | None = None
+    channel: str | None = None
+    stage: str = "planned"
+    deadline_at: datetime | None = None
+    notes: str | None = None
+
+
+class ApplicationUpdate(BaseModel):
+    company: str | None = None
+    role: str | None = None
+    channel: str | None = None
+    stage: str | None = None
+    deadline_at: datetime | None = None
+    last_contact_at: datetime | None = None
+    notes: str | None = None
+
+
+class TransitionRequest(BaseModel):
+    to_stage: str
+    note: str | None = None
+
+
+def _serialize_application(app_record: ApplicationRecord) -> dict:
+    return {
+        "id": app_record.id,
+        "company": app_record.company,
+        "role": app_record.role,
+        "jd_document_id": app_record.jd_document_id,
+        "resume_document_id": app_record.resume_document_id,
+        "process_job_id": app_record.process_job_id,
+        "channel": app_record.channel,
+        "stage": app_record.stage,
+        "deadline_at": app_record.deadline_at.isoformat() if app_record.deadline_at else None,
+        "last_contact_at": app_record.last_contact_at.isoformat() if app_record.last_contact_at else None,
+        "notes": app_record.notes,
+        "created_at": app_record.created_at.isoformat() if app_record.created_at else None,
+        "updated_at": app_record.updated_at.isoformat() if app_record.updated_at else None,
+    }
+
+
+@app.post("/api/v1/applications")
+def create_application(
+    req: ApplicationCreate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    record = ApplicationRecord(
+        user_id=current_user.id,
+        company=req.company,
+        role=req.role,
+        jd_document_id=req.jd_document_id,
+        resume_document_id=req.resume_document_id,
+        process_job_id=req.process_job_id,
+        channel=req.channel,
+        stage=req.stage,
+        deadline_at=req.deadline_at,
+        notes=req.notes,
+    )
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+    db.add(ApplicationTimeline(application_id=record.id, from_stage=None, to_stage=req.stage, note="created"))
+    db.commit()
+    return _serialize_application(record)
+
+
+@app.get("/api/v1/applications")
+def list_applications(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    stage: str | None = None,
+):
+    q = db.query(ApplicationRecord).filter(ApplicationRecord.user_id == current_user.id)
+    if stage:
+        q = q.filter(ApplicationRecord.stage == stage)
+    return [_serialize_application(r) for r in q.order_by(ApplicationRecord.updated_at.desc()).all()]
+
+
+@app.get("/api/v1/applications/dashboard")
+def applications_dashboard(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    rows = db.query(ApplicationRecord).filter(ApplicationRecord.user_id == current_user.id).all()
+    by_stage: dict[str, int] = {}
+    upcoming: list[dict] = []
+    now = _dt.utcnow()
+    for r in rows:
+        by_stage[r.stage] = by_stage.get(r.stage, 0) + 1
+        if r.deadline_at and r.deadline_at >= now:
+            upcoming.append({"id": r.id, "company": r.company, "role": r.role, "deadline_at": r.deadline_at.isoformat()})
+    upcoming.sort(key=lambda x: x["deadline_at"])
+    return {"total": len(rows), "by_stage": by_stage, "upcoming_deadlines": upcoming[:10]}
+
+
+@app.patch("/api/v1/applications/{app_id}")
+def update_application(
+    app_id: int,
+    req: ApplicationUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    record = db.query(ApplicationRecord).filter(
+        ApplicationRecord.id == app_id, ApplicationRecord.user_id == current_user.id
+    ).first()
+    if not record:
+        raise HTTPException(status_code=404, detail="Application not found")
+    for field, value in req.model_dump(exclude_unset=True).items():
+        setattr(record, field, value)
+    db.commit()
+    db.refresh(record)
+    return _serialize_application(record)
+
+
+@app.post("/api/v1/applications/{app_id}/transition")
+def transition_application(
+    app_id: int,
+    req: TransitionRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    record = db.query(ApplicationRecord).filter(
+        ApplicationRecord.id == app_id, ApplicationRecord.user_id == current_user.id
+    ).first()
+    if not record:
+        raise HTTPException(status_code=404, detail="Application not found")
+    from_stage = record.stage
+    record.stage = req.to_stage
+    record.last_contact_at = _dt.utcnow()
+    db.add(ApplicationTimeline(application_id=record.id, from_stage=from_stage, to_stage=req.to_stage, note=req.note))
+    db.commit()
+    db.refresh(record)
+    return _serialize_application(record)
+
+
+@app.delete("/api/v1/applications/{app_id}")
+def delete_application(
+    app_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    record = db.query(ApplicationRecord).filter(
+        ApplicationRecord.id == app_id, ApplicationRecord.user_id == current_user.id
+    ).first()
+    if not record:
+        raise HTTPException(status_code=404, detail="Application not found")
+    db.delete(record)
+    db.commit()
+    return {"status": "deleted"}
+
+
+# ---------- Feedback & Events (Batch I) ----------
+
+
+class FeedbackRequest(BaseModel):
+    target_type: str
+    target_id: str
+    rating: int = Field(..., ge=-1, le=1)
+    comment: str | None = None
+
+
+@app.post("/api/v1/feedback")
+def submit_feedback(
+    req: FeedbackRequest,
+    current_user: User | None = Depends(get_current_user_optional),
+    db: Session = Depends(get_db),
+):
+    entry = FeedbackEntry(
+        user_id=current_user.id if current_user else None,
+        target_type=req.target_type,
+        target_id=req.target_id,
+        rating=req.rating,
+        comment=req.comment,
+    )
+    db.add(entry)
+    db.commit()
+    return {"status": "ok", "id": entry.id}
+
+
+class TrackEventRequest(BaseModel):
+    event: str
+    properties: dict | None = None
+
+
+@app.post("/api/v1/events/track")
+def track_event(
+    req: TrackEventRequest,
+    current_user: User | None = Depends(get_current_user_optional),
+    db: Session = Depends(get_db),
+):
+    db.add(AnalyticsEvent(
+        user_id=current_user.id if current_user else None,
+        event=req.event,
+        properties_json=req.properties or {},
+    ))
+    db.commit()
+    return {"status": "ok"}
+
+
+# ---------- Privacy / Consent (Batch G) ----------
+
+
+@app.post("/api/v1/users/me/llm-consent")
+def grant_llm_consent(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    current_user.llm_processing_consent_at = _dt.utcnow()
+    db.commit()
+    return {"granted_at": current_user.llm_processing_consent_at.isoformat()}
+
+
+@app.delete("/api/v1/users/me/data")
+def delete_my_data(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """GDPR/PIPL：用户主动注销，按相关性删除其数据。"""
+
+    uid = current_user.id
+    db.query(ApplicationTimeline).filter(
+        ApplicationTimeline.application_id.in_(
+            db.query(ApplicationRecord.id).filter(ApplicationRecord.user_id == uid)
+        )
+    ).delete(synchronize_session=False)
+    db.query(ApplicationRecord).filter(ApplicationRecord.user_id == uid).delete()
+    db.query(ChatMessage).filter(
+        ChatMessage.session_id.in_(db.query(ChatSession.id).filter(ChatSession.user_id == uid))
+    ).delete(synchronize_session=False)
+    db.query(ChatSession).filter(ChatSession.user_id == uid).delete()
+    db.query(ResumeProcessJob).filter(ResumeProcessJob.user_id == uid).delete()
+    db.query(ResumeDocument).filter(ResumeDocument.user_id == uid).delete()
+    db.query(JDDocument).filter(JDDocument.user_id == uid).delete()
+    db.query(InterviewSession).filter(InterviewSession.user_id == uid).delete()
+    db.query(FeedbackEntry).filter(FeedbackEntry.user_id == uid).delete()
+    db.query(UsageEvent).filter(UsageEvent.user_id == uid).delete()
+    db.query(AnalyticsEvent).filter(AnalyticsEvent.user_id == uid).delete()
+    db.add(AuditLog(user_id=uid, actor="self", action="delete_my_data", target_type="user", target_id=str(uid)))
+    db.delete(current_user)
+    db.commit()
+    return {"status": "deleted"}
+
+
+# ---------- Chat sessions (Batch F) ----------
+
+
+class ChatSessionStartRequest(BaseModel):
+    title: str | None = None
+
+
+@app.post("/api/v1/chat/sessions")
+def create_chat_session(
+    req: ChatSessionStartRequest,
+    current_user: User | None = Depends(get_current_user_optional),
+    db: Session = Depends(get_db),
+):
+    sid = uuid.uuid4().hex
+    profile = None
+    if current_user is not None:
+        profile = {
+            "target_role": current_user.target_role,
+            "city": current_user.city,
+            "profile_summary": current_user.profile_summary,
+        }
+    session = ChatSession(
+        id=sid,
+        user_id=current_user.id if current_user else None,
+        title=req.title,
+        profile_snapshot_json=profile,
+    )
+    db.add(session)
+    db.commit()
+    return {"session_id": sid, "title": req.title}
+
+
+@app.get("/api/v1/chat/sessions/{session_id}/messages")
+def list_chat_messages(
+    session_id: str,
+    current_user: User | None = Depends(get_current_user_optional),
+    db: Session = Depends(get_db),
+):
+    rows = db.query(ChatMessage).filter(ChatMessage.session_id == session_id).order_by(ChatMessage.id.asc()).all()
+    return [{"role": r.role, "content": r.content, "created_at": r.created_at.isoformat()} for r in rows]
+
+
+# ---------- Mock interview report export (Batch C6) ----------
+
+
+@app.get("/api/v1/interview/sessions/{session_id}/export")
+def export_interview_report(
+    session_id: str,
+    fmt: str = "md",
+    current_user: User | None = Depends(get_current_user_optional),
+    db: Session = Depends(get_db),
+):
+    session = db.query(InterviewSession).filter(InterviewSession.id == session_id).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if current_user and session.user_id and session.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    turns = (
+        db.query(InterviewTurn)
+        .filter(InterviewTurn.session_id == session_id)
+        .order_by(InterviewTurn.turn_index.asc())
+        .all()
+    )
+    summary = _build_interview_summary(session, turns)
+    lines = [f"# 模拟面试复盘 - {session.target_company or ''} {session.target_role or ''}".strip(), ""]
+    lines.append(f"**总分**: {summary.get('overall_score', 0)}")
+    dim = summary.get("dimension_scores") or {}
+    if dim:
+        lines.append("**各维度**: " + ", ".join(f"{k}={v}" for k, v in dim.items()))
+    lines.append("")
+    lines.append("## 核心改进项")
+    for imp in summary.get("improvements", []):
+        lines.append(f"- {imp}")
+    lines.append("")
+    lines.append("## 优势")
+    for s in summary.get("strengths", []):
+        lines.append(f"- {s}")
+    lines.append("")
+    lines.append("## 题目复盘")
+    for t in turns:
+        lines.append(f"### Q{t.turn_index + 1}: {t.question_text or ''}")
+        lines.append(f"**我的回答**: {t.answer_text or ''}")
+        lines.append(f"**反馈**: {t.feedback or ''}")
+        lines.append("")
+    md = "\n".join(lines)
+    if fmt == "json":
+        return {"summary": summary, "turns": [_serialize_interview_turn(t) for t in turns]}
+    return {"format": "markdown", "content": md}
+
+
+# ---------- 静态注册：暴露 PII redact 工具 (Batch G) ----------
+
+
+def _redact_for_llm(text: str) -> tuple[str, dict[str, str]]:
+    return pii_utils.redact(text)

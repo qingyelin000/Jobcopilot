@@ -24,10 +24,12 @@ from interview.retriever_v2 import (
 )
 
 
+# 分词与字符串归一化：英文词、中文连续片段、以及软匹配清洗规则。
 ASCII_WORD_PATTERN = re.compile(r"[A-Za-z0-9+#.\-]{2,}")
 CHINESE_SEGMENT_PATTERN = re.compile(r"[\u4e00-\u9fff]{2,}")
 ALNUM_CJK_PATTERN = re.compile(r"[^0-9a-z\u4e00-\u9fff]+")
 
+# 低信息量停用词（中英混合）；用于过滤关键词噪声。
 STOPWORDS = {
     "and",
     "the",
@@ -62,6 +64,8 @@ STOPWORDS = {
 
 @dataclass(frozen=True)
 class EvalCase:
+    """单条评测样本。支持 query/resume/jd 输入与多级相关性标注。"""
+
     case_id: str
     query: str
     resume_text: str
@@ -74,6 +78,7 @@ class EvalCase:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    # 参数分为三类：评测数据、评测超参、RetrieverV2 后端配置。
     parser = argparse.ArgumentParser(
         description="Evaluate RetrieverV2 quality with labeled cases (JSONL).",
     )
@@ -170,6 +175,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def to_float(value: Any, default: float = 0.0) -> float:
+    # 容错转换，避免脏数据导致评测中断。
     try:
         return float(value)
     except (TypeError, ValueError):
@@ -177,6 +183,7 @@ def to_float(value: Any, default: float = 0.0) -> float:
 
 
 def to_int(value: Any, default: int = 0) -> int:
+    # 容错转换，避免脏数据导致评测中断。
     try:
         return int(value)
     except (TypeError, ValueError):
@@ -184,6 +191,7 @@ def to_int(value: Any, default: int = 0) -> int:
 
 
 def normalize_match_text(value: str | None) -> str:
+    # 统一小写并仅保留数字/英文/中文，便于“软匹配”。
     if not value:
         return ""
     lowered = str(value).lower().strip()
@@ -191,6 +199,7 @@ def normalize_match_text(value: str | None) -> str:
 
 
 def match_soft(target: str | None, candidate: str | None) -> bool:
+    # 双向包含匹配：A 包含 B 或 B 包含 A 均视为命中。
     normalized_target = normalize_match_text(target)
     normalized_candidate = normalize_match_text(candidate)
     if not normalized_target or not normalized_candidate:
@@ -199,6 +208,7 @@ def match_soft(target: str | None, candidate: str | None) -> bool:
 
 
 def parse_iso_datetime(value: Any) -> datetime | None:
+    # 兼容 ISO 字符串（含/不含时区），统一转为 UTC。
     if value is None:
         return None
     raw = str(value).strip()
@@ -216,6 +226,7 @@ def parse_iso_datetime(value: Any) -> datetime | None:
 
 
 def tokenize_text(text: str) -> list[str]:
+    # 中英文混合分词：英文按词切分，中文同时保留片段和 bi-gram。
     tokens: list[str] = []
     lowered = text.lower()
 
@@ -236,6 +247,7 @@ def tokenize_text(text: str) -> list[str]:
 
 
 def is_informative_token(token: str) -> bool:
+    # 过滤停用词、纯数字、超短词，保留更有语义的词项。
     lowered = token.lower().strip()
     if not lowered:
         return False
@@ -249,6 +261,7 @@ def is_informative_token(token: str) -> bool:
 
 
 def build_resume_anchor_terms(case: EvalCase) -> set[str]:
+    # 从简历/JD/query/公司岗位中抽取“锚点词”，用于评估结果对齐度。
     anchors: set[str] = set()
     if case.resume_keywords:
         for keyword in case.resume_keywords:
@@ -286,6 +299,7 @@ def build_resume_anchor_terms(case: EvalCase) -> set[str]:
 
 
 def compute_duplicate_metrics(signatures: list[str]) -> tuple[float, float]:
+    # 基于签名唯一度估算重复率与多样性。
     if not signatures:
         return 1.0, 0.0
     unique_count = len(set(signatures))
@@ -301,6 +315,7 @@ def freshness_from_publish_time(
     now_utc: datetime,
     half_life_days: float,
 ) -> float | None:
+    # 指数衰减时效分：越新分越高；half_life_days 控制衰减速度。
     published_at = parse_iso_datetime(publish_time)
     if published_at is None:
         return None
@@ -311,10 +326,12 @@ def freshness_from_publish_time(
 
 
 def rank_weights(count: int) -> list[float]:
+    # 按排名折损加权（靠前结果权重更高）。
     return [1.0 / math.log2(index + 2.0) for index in range(count)]
 
 
 def weighted_average(values: list[float | None], weights: list[float]) -> float | None:
+    # 忽略 None 值后计算加权平均。
     weighted_sum = 0.0
     total_weight = 0.0
     for index, value in enumerate(values):
@@ -341,6 +358,7 @@ def company_role_match_score(
     question_company: str | None,
     question_role: str | None,
 ) -> float | None:
+    # 公司/岗位软匹配得分；同时命中 > 仅岗位命中 > 仅公司命中。
     has_company_target = bool(target_company.strip())
     has_role_target = bool(target_role.strip())
     if not has_company_target and not has_role_target:
@@ -363,6 +381,7 @@ def company_role_match_score(
 
 
 def overlap_ratio(base_terms: set[str], candidate_terms: set[str]) -> float:
+    # 候选词项覆盖率：|交集| / |基准词集|。
     if not base_terms or not candidate_terms:
         return 0.0
     overlap = len(base_terms.intersection(candidate_terms))
@@ -370,6 +389,8 @@ def overlap_ratio(base_terms: set[str], candidate_terms: set[str]) -> float:
 
 
 def load_cases(path: Path, *, default_top_k: int, strict: bool) -> tuple[list[EvalCase], int]:
+    # 读取 JSONL 评测集，兼容三种标注形式：
+    # 1) relevance 字典；2) relevant_question_ids 列表；3) judgments 列表。
     cases: list[EvalCase] = []
     skipped = 0
     for line_no, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
@@ -461,6 +482,7 @@ def load_cases(path: Path, *, default_top_k: int, strict: bool) -> tuple[list[Ev
 
 
 def dcg_at_k(gains: list[float], k: int) -> float:
+    # 标准 DCG@K：sum((2^rel - 1) / log2(rank+1))。
     score = 0.0
     for idx, gain in enumerate(gains[:k], start=1):
         if gain <= 0:
@@ -476,6 +498,7 @@ def compute_quality_score(
     company_role_match_at_k: float | None,
     resume_alignment_at_k: float | None,
 ) -> float | None:
+    # 无监督综合质量分（0~1）：对齐度、公司岗位匹配、多样性、时效性加权融合。
     components = (
         (resume_alignment_at_k, 0.30),
         (company_role_match_at_k, 0.30),
@@ -502,6 +525,7 @@ def evaluate_case(
     freshness_half_life_days: float,
     now_utc: datetime,
 ) -> dict[str, Any]:
+    # 单条样本评测：先检索，再计算有监督相关性指标与无监督质量指标。
     results = retriever.search(
         resume_text=case.resume_text,
         jd_text=case.jd_text,
@@ -516,6 +540,7 @@ def evaluate_case(
     has_labels = bool(case.relevance)
 
     if has_labels:
+        # 有标注时计算经典检索指标（Hit/Precision/Recall/MRR/MAP/NDCG）。
         positive_ids = {qid for qid, score in case.relevance.items() if score >= min_relevance}
         positive_count = len(positive_ids)
         hit_flags = [1 if case.relevance.get(qid, 0.0) >= min_relevance else 0 for qid in ranked_ids]
@@ -545,6 +570,7 @@ def evaluate_case(
         idcg = dcg_at_k(ideal_gains, case.top_k)
         ndcg_at_k = dcg / idcg if idcg > 0 else 0.0
     else:
+        # 无标注样本仅保留无监督质量维度。
         positive_count = None
         retrieved_positive = None
         hit_at_k = None
@@ -558,6 +584,7 @@ def evaluate_case(
     freshness_scores: list[float | None] = []
     company_role_scores: list[float | None] = []
     resume_alignment_scores: list[float] = []
+    # 锚点词来自简历/JD/query/目标公司岗位，用于衡量检索结果语义对齐程度。
     resume_anchor_terms = build_resume_anchor_terms(case)
 
     for item in ranked:
@@ -609,6 +636,7 @@ def evaluate_case(
         weights,
     ) if resume_anchor_terms else None
 
+    # 业务向指标：Top3 是否出现“公司+岗位”同时命中的问题。
     has_company_and_role_target = bool(case.target_company.strip()) and bool(case.target_role.strip())
     top3_company_role_hit = None
     if has_company_and_role_target:
@@ -656,12 +684,14 @@ def evaluate_case(
 
 
 def avg(values: list[float]) -> float:
+    # 统一均值入口，空列表返回 0 方便后续汇总。
     if not values:
         return 0.0
     return float(statistics.fmean(values))
 
 
 def metric_values(per_case: list[dict[str, Any]], key: str) -> list[float]:
+    # 提取某个指标在所有 case 上的数值（忽略 None）。
     values: list[float] = []
     for item in per_case:
         value = item.get(key)
@@ -671,6 +701,7 @@ def metric_values(per_case: list[dict[str, Any]], key: str) -> list[float]:
 
 
 def build_metric_summary(per_case: list[dict[str, Any]], key: str) -> tuple[float | None, int]:
+    # 返回 (均值, 覆盖样本数)。
     values = metric_values(per_case, key)
     if not values:
         return None, 0
@@ -678,6 +709,7 @@ def build_metric_summary(per_case: list[dict[str, Any]], key: str) -> tuple[floa
 
 
 def main() -> int:
+    # 主流程：解析参数 -> 载入样本 -> 批量评测 -> 聚合汇总 -> 写出报告。
     parser = build_parser()
     args = parser.parse_args()
 
@@ -722,6 +754,7 @@ def main() -> int:
         for case in cases
     ]
 
+    # 相关性指标汇总。
     hit_rate_at_k, hit_coverage = build_metric_summary(per_case, "hit_at_k")
     precision_at_k, precision_coverage = build_metric_summary(per_case, "precision_at_k")
     recall_at_k, recall_coverage = build_metric_summary(per_case, "recall_at_k")
@@ -729,6 +762,7 @@ def main() -> int:
     map_at_k, map_coverage = build_metric_summary(per_case, "map_at_k")
     ndcg_at_k, ndcg_coverage = build_metric_summary(per_case, "ndcg_at_k")
 
+    # 质量指标汇总。
     dup_rate_at_k, dup_coverage = build_metric_summary(per_case, "dup_rate_at_k")
     diversity_at_k, diversity_coverage = build_metric_summary(per_case, "diversity_at_k")
     freshness_at_k, freshness_coverage = build_metric_summary(per_case, "freshness_at_k")
@@ -779,6 +813,7 @@ def main() -> int:
     }
 
     def worst_case_key(item: dict[str, Any]) -> float:
+        # 优先按 quality_score 排序；无该值时回退到 ndcg。
         quality = item.get("quality_score")
         if isinstance(quality, (int, float)):
             return float(quality)
