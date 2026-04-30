@@ -26,6 +26,88 @@ from .lexical_retriever import (
 
 
 NON_ALNUM_CJK_PATTERN = re.compile(r"[^0-9a-z\u4e00-\u9fff]+")
+ASCII_TERM_PATTERN = re.compile(r"^[a-z0-9+#.\-@]+$")
+
+TOPIC_STOP_TERMS = {
+    "java",
+    "后端",
+    "开发",
+    "面试",
+    "面试题",
+    "候选",
+    "候选人",
+    "画像",
+    "岗位",
+    "要求",
+    "掌握",
+    "熟悉",
+    "项目",
+    "实践",
+    "系统",
+    "设计",
+    "稳定",
+    "扩展",
+}
+
+TECH_TOPIC_PHRASES: tuple[tuple[str, float], ...] = (
+    ("springboot", 2.2),
+    ("spring boot", 2.2),
+    ("自动配置", 1.8),
+    ("启动流程", 1.8),
+    ("jvm", 2.2),
+    ("gc", 2.2),
+    ("垃圾回收", 1.8),
+    ("标记清除", 1.7),
+    ("分代", 1.4),
+    ("类加载", 1.7),
+    ("双亲委派", 1.7),
+    ("redis", 2.1),
+    ("redisson", 2.0),
+    ("分布式锁", 2.0),
+    ("缓存穿透", 1.7),
+    ("缓存雪崩", 1.7),
+    ("缓存击穿", 1.7),
+    ("mysql", 2.1),
+    ("mvcc", 1.8),
+    ("联合索引", 1.8),
+    ("最左前缀", 1.8),
+    ("隔离级别", 1.6),
+    ("间隙锁", 1.6),
+    ("线程池", 2.0),
+    ("threadpoolexecutor", 2.0),
+    ("拒绝策略", 1.6),
+    ("hashmap", 2.0),
+    ("红黑树", 1.6),
+    ("synchronized", 1.8),
+    ("volatile", 1.8),
+    ("aqs", 1.8),
+    ("kafka", 2.0),
+    ("rocketmq", 2.0),
+    ("消息队列", 1.9),
+    ("消息不丢失", 1.8),
+    ("限流", 1.7),
+    ("熔断", 1.7),
+    ("降级", 1.7),
+    ("秒杀", 1.9),
+    ("@transactional", 1.8),
+    ("事务", 1.4),
+    ("传播机制", 1.6),
+    ("tcp", 1.9),
+    ("udp", 1.8),
+    ("http", 1.8),
+    ("https", 1.8),
+    ("linux", 1.8),
+    ("docker", 1.8),
+    ("elasticsearch", 2.0),
+    ("es", 1.7),
+    ("微服务", 1.8),
+    ("操作系统", 1.8),
+    ("agent", 1.8),
+    ("执行链路", 1.6),
+    ("技术选型", 1.5),
+    ("数据库", 1.3),
+    ("表结构", 1.5),
+)
 
 DEFAULT_QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333").strip() or "http://localhost:6333"
 DEFAULT_QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", "").strip()
@@ -111,6 +193,37 @@ def _token_overlap(anchor_terms: set[str], text: str) -> float:
         return 0.0
     overlap = len(anchor_terms.intersection(candidate_terms))
     return overlap / len(anchor_terms)
+
+
+def _contains_topic_term(*, text_normalized: str, text_tokens: set[str], term: str) -> bool:
+    if not term:
+        return False
+    if ASCII_TERM_PATTERN.match(term) and len(term) <= 3:
+        return term in text_tokens
+    return term in text_normalized
+
+
+def _topic_coverage(topic_terms: dict[str, float], text: str) -> tuple[float, list[str]]:
+    if not topic_terms:
+        return 0.0, []
+    normalized_text = _normalize_for_match(text)
+    text_tokens = _token_set(text)
+    matched: list[str] = []
+    matched_weight = 0.0
+    total_weight = 0.0
+    for term, weight in topic_terms.items():
+        safe_weight = max(float(weight), 0.0)
+        total_weight += safe_weight
+        if _contains_topic_term(
+            text_normalized=normalized_text,
+            text_tokens=text_tokens,
+            term=term,
+        ):
+            matched.append(term)
+            matched_weight += safe_weight
+    if total_weight <= 0.0:
+        return 0.0, matched
+    return matched_weight / total_weight, matched
 
 
 def _freshness_score(publish_time: str | None, *, now_utc: datetime, half_life_days: float = 180.0) -> float:
@@ -396,6 +509,44 @@ class RetrieverV2:
         }
 
     @staticmethod
+    def _extract_topic_terms(
+        *,
+        resume_text: str,
+        jd_text: str,
+        extra_query: str | None,
+    ) -> dict[str, float]:
+        query_text = str(extra_query or "")
+        merged = " ".join(part for part in (query_text, jd_text, resume_text) if part)
+        normalized_merged = _normalize_for_match(merged)
+        topic_terms: dict[str, float] = {}
+
+        for phrase, weight in TECH_TOPIC_PHRASES:
+            normalized_phrase = _normalize_for_match(phrase)
+            if not normalized_phrase:
+                continue
+            if _contains_topic_term(
+                text_normalized=normalized_merged,
+                text_tokens=_token_set(merged),
+                term=normalized_phrase,
+            ):
+                topic_terms[normalized_phrase] = max(topic_terms.get(normalized_phrase, 0.0), float(weight))
+
+        query_tokens = {
+            token.lower().strip()
+            for token in tokenize_for_embedding(query_text)
+            if len(token.strip()) > 1
+        }
+        for token in query_tokens:
+            normalized = _normalize_for_match(token)
+            if not normalized or normalized in TOPIC_STOP_TERMS:
+                continue
+            if normalized.isdigit():
+                continue
+            topic_terms[normalized] = max(topic_terms.get(normalized, 0.0), 1.0)
+
+        return dict(sorted(topic_terms.items(), key=lambda item: item[1], reverse=True)[:12])
+
+    @staticmethod
     def _compose_rerank_document(question: RetrievalQuestion) -> str:
         parts = [
             str(question.company or "").strip(),
@@ -550,14 +701,37 @@ class RetrieverV2:
             target_company=target_company,
             target_role=target_role,
         )
+        topic_terms = self._extract_topic_terms(
+            resume_text=resume_text,
+            jd_text=jd_text,
+            extra_query=extra_query,
+        )
 
         rough_scores: list[float] = []
         for index, candidate in enumerate(candidates):
             dense_score = normalized_dense_scores[index]
             lexical_score = normalized_lexical_scores[index]
             rrf_score = _rank_score(candidate.dense_rank) + _rank_score(candidate.lexical_rank)
+            topic_score, _ = _topic_coverage(
+                topic_terms,
+                " ".join(
+                    part
+                    for part in (
+                        candidate.question.company or "",
+                        candidate.question.role or "",
+                        candidate.question.question_type or "",
+                        candidate.question.question_text,
+                    )
+                    if part
+                ),
+            )
             # 粗排仅用于筛选 rerank 候选，不直接作为最终输出分。
-            rough_scores.append(0.55 * dense_score + 0.25 * lexical_score + 0.20 * rrf_score)
+            rough_scores.append(
+                0.44 * dense_score
+                + 0.20 * lexical_score
+                + 0.16 * rrf_score
+                + 0.20 * topic_score
+            )
 
         rerank_raw_scores = [0.0] * len(candidates)
         if self.rerank_enabled and candidates:
@@ -616,15 +790,29 @@ class RetrieverV2:
                     if part
                 ),
             )
+            topic_score, matched_topic_terms = _topic_coverage(
+                topic_terms,
+                " ".join(
+                    part
+                    for part in (
+                        question.company or "",
+                        question.role or "",
+                        question.question_type or "",
+                        question.question_text,
+                    )
+                    if part
+                ),
+            )
             freshness_score = _freshness_score(question.publish_time, now_utc=now_utc)
 
             # Dense 召回 + 词法召回 + RRF + 简历对齐 + 二阶段 rerank 融合。
             text_relevance_score = (
-                0.36 * dense_score
-                + 0.18 * lexical_score
-                + 0.10 * rrf_score
-                + 0.16 * resume_align_score
-                + 0.20 * rerank_score
+                0.30 * dense_score
+                + 0.15 * lexical_score
+                + 0.08 * rrf_score
+                + 0.10 * resume_align_score
+                + 0.20 * topic_score
+                + 0.17 * rerank_score
             )
             # 最终分：文本相关性为主，再叠加公司/岗位匹配与时效性。
             final_score = (
@@ -638,7 +826,7 @@ class RetrieverV2:
                 RetrievedQuestion(
                     question=question,
                     score=round(final_score, 6),
-                    matched_keywords=[],
+                    matched_keywords=matched_topic_terms,
                     score_breakdown={
                         "text_relevance": round(text_relevance_score, 6),
                         "dense": round(dense_score, 6),
@@ -650,6 +838,7 @@ class RetrieverV2:
                         "role": round(role_score, 6),
                         "company": round(company_score, 6),
                         "resume_align": round(resume_align_score, 6),
+                        "topic_coverage": round(topic_score, 6),
                         "freshness": round(freshness_score, 6),
                     },
                 )
